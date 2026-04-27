@@ -49,37 +49,61 @@ def parse_pdf(filepath: str) -> str:
 
 def split_by_situations(text: str) -> list[dict]:
     """
-    Режет документ по смысловым блокам.
-    Ищет заголовки: Ситуация N, Цель интента, Описание интента,
-    Шаблон ответа, Требования и т.д.
+    Splits document into semantic blocks by situation headers.
+    Enriches each chunk with keywords for better RAG retrieval.
     """
     pattern = r'(Ситуация\s+\d+[^\n]*|Цель интента|Описание интента|Шаблон ответа|Требования[^\n]*)'
-
     parts = re.split(pattern, text)
 
     chunks = []
     i = 0
+    current_situation = None
+
     while i < len(parts):
         part = parts[i].strip()
 
-        if re.match(r'Ситуация\s+\d+', part) or part in [
-            'Цель интента', 'Описание интента', 'Шаблон ответа'
-        ] or re.match(r'Требования', part):
-            # Заголовок + следующий блок контента
-            title = part
+        if re.match(r'Ситуация\s+\d+', part):
+            current_situation = part
             content = parts[i + 1].strip() if i + 1 < len(parts) else ""
             if content:
                 chunks.append({
-                    "title": title,
-                    "text": f"{title}\n\n{content}"
+                    "title": part,
+                    "text": f"{part}\n\n{content}",
+                    "situation": part
                 })
             i += 2
+
+        elif part == 'Шаблон ответа':
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if content and current_situation:
+                # Attach template directly to its situation
+                # Find the last situation chunk and append template
+                if chunks and chunks[-1].get("situation") == current_situation:
+                    chunks[-1]["text"] += f"\n\nШаблон ответа:\n{content}"
+                else:
+                    chunks.append({
+                        "title": f"Шаблон ответа — {current_situation}",
+                        "text": f"{current_situation}\n\nШаблон ответа:\n{content}",
+                        "situation": current_situation
+                    })
+            i += 2
+
+        elif part in ['Цель интента', 'Описание интента'] or re.match(r'Требования', part):
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if content and len(content) > 50:
+                chunks.append({
+                    "title": part,
+                    "text": f"{part}\n\n{content}",
+                    "situation": None
+                })
+            i += 2
+
         else:
-            # Общий текст без заголовка
-            if part and len(part) > 50:  # игнорируем слишком короткие куски
+            if part and len(part) > 50:
                 chunks.append({
                     "title": "Общая информация",
-                    "text": part
+                    "text": part,
+                    "situation": None
                 })
             i += 1
 
@@ -169,6 +193,7 @@ async def ingest_file(filepath: str, filename: str):
                         "filename": filename,
                         "title": chunk["title"],
                         "text": chunk["text"],
+                        "situation": chunk.get("situation"),
                         "chunk_idx": i
                     }
                 )
