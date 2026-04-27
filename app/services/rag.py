@@ -23,7 +23,7 @@ async def get_embedding(text: str) -> list[float]:
         return response.json()["embedding"]
 
 # Search in Qdrant using the embedding and return context
-async def search_docs(query: str, top_k: int = 5) -> str:
+async def search_docs(query: str, top_k: int = 7) -> str:
     try:
         embedding = await get_embedding(query)
 
@@ -50,11 +50,17 @@ async def search_docs(query: str, top_k: int = 5) -> str:
         ]
         sorted_points = priority_points + other_points
 
-        context = "\n\n".join([
-            f"[{p.payload.get('title', 'doc')}]:\n{p.payload.get('text', '')}"
-            for p in sorted_points
-        ])
-        return context
+        # Build context with clear section separators
+        context_parts = []
+        for p in sorted_points:
+            title = p.payload.get('title', '')
+            text = p.payload.get('text', '')
+            filename = p.payload.get('filename', '')
+            context_parts.append(
+                f"=== ДОКУМЕНТ: {filename} | РАЗДЕЛ: {title} ===\n{text}"
+            )
+
+        return "\n\n".join(context_parts)
 
     except Exception as e:
         print(f"Qdrant search error: {e}")
