@@ -4,13 +4,22 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+*.egg-info/
+dist/
+build/
 
-# Data
+# Data & Storage
 data/docs/
+data/lightrag/
+*.db
+
+# Logs
+logs/
+*.log
 
 # IDE
 .idea/
 .vscode/
 
-#Assistant
-CLAUDE.md
+# Claude Code
+.ai-activity/
