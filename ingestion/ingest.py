@@ -1,33 +1,15 @@
 import os
 import re
-import uuid
+import time
 import asyncio
-import httpx
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
 from dotenv import load_dotenv
+from app.services import lightrag_service
 
 load_dotenv()
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "isel_docs")
 
-client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-
-
-async def get_embedding(text: str) -> list[float]:
-    """Создаёт embedding через Ollama nomic-embed-text."""
-    async with httpx.AsyncClient(timeout=60.0) as http:
-        response = await http.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": OLLAMA_EMBED_MODEL, "prompt": text}
-        )
-        return response.json()["embedding"]
 
 
 def parse_pdf(filepath: str) -> str:
@@ -218,40 +200,11 @@ def split_by_chunks(text: str, chunk_size: int = 800, overlap: int = 100) -> lis
     return chunks
 
 
-def ensure_collection():
-    """Создаёт коллекцию если не существует."""
-    collections = client.get_collections().collections
-    exists = any(c.name == QDRANT_COLLECTION for c in collections)
-
-    if not exists:
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-        )
-        print(f"✅ Коллекция '{QDRANT_COLLECTION}' создана.")
-    else:
-        print(f"ℹ️  Коллекция '{QDRANT_COLLECTION}' уже существует.")
-
-
-def recreate_collection():
-    """Drops and recreates the collection — wipes all existing vectors."""
-    collections = client.get_collections().collections
-    exists = any(c.name == QDRANT_COLLECTION for c in collections)
-
-    if exists:
-        client.delete_collection(QDRANT_COLLECTION)
-        print(f"🗑️  Коллекция '{QDRANT_COLLECTION}' удалена.")
-
-    client.create_collection(
-        collection_name=QDRANT_COLLECTION,
-        vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-    )
-    print(f"✅ Коллекция '{QDRANT_COLLECTION}' создана заново.")
 
 
 async def ingest_file(filepath: str, filename: str):
-    """Обрабатывает один файл и заливает чанки в Qdrant."""
-    print(f"\n📄 Обработка: {filename}")
+    """Process a document and insert structured blocks into LightRAG."""
+    print(f"\n📄 Processing: {filename}")
 
     ext = filename.lower().split(".")[-1]
     if ext == "pdf":
@@ -262,11 +215,11 @@ async def ingest_file(filepath: str, filename: str):
         with open(filepath, "r", encoding="utf-8") as f:
             text = f.read()
     else:
-        print(f"⚠️  Формат .{ext} не поддерживается, пропускаем.")
+        print(f"⚠️  Unsupported format .{ext}, skipping.")
         return
 
     if not text.strip():
-        print(f"⚠️  Файл пустой, пропускаем.")
+        print(f"⚠️  Empty file, skipping.")
         return
 
     intent_name_raw = _extract_intent_name(text)
@@ -274,65 +227,53 @@ async def ingest_file(filepath: str, filename: str):
     chunks = split_by_situations(text, filename)
 
     if not chunks:
-        print(f"ℹ️  Смысловые блоки не найдены, используем разбивку по чанкам.")
+        print(f"ℹ️  No semantic blocks found, using fixed-size chunking.")
         chunks = split_by_chunks(text)
         for chunk in chunks:
             chunk["intent"] = intent_slug
             chunk["intent_name"] = intent_name
 
     print(f"🎯 Intent: {intent_slug} ({intent_name})")
-    print(f"📦 Найдено блоков: {len(chunks)}")
+    print(f"📦 Found {len(chunks)} blocks")
     debug_chunks(chunks, filename)
 
     for i, chunk in enumerate(chunks):
-        vector = await get_embedding(chunk["text"])
+        chunk_language = _detect_language(chunk["text"])
+        metadata = f"[FILENAME: {filename}] [INTENT: {intent_slug}] [LANGUAGE: {chunk_language}] [TITLE: {chunk['title']}]"
 
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{filename}_{i}"))
+        try:
+            await lightrag_service.insert_text(chunk["text"], metadata=metadata)
+            print(f"  ✅ [{i + 1}/{len(chunks)}] {chunk['title']}")
+            if i < len(chunks) - 1:
+                time.sleep(1)
+        except Exception as e:
+            print(f"  ❌ [{i + 1}/{len(chunks)}] {chunk['title']}: {str(e)}")
+            raise
 
-        client.upsert(
-            collection_name=QDRANT_COLLECTION,
-            points=[
-                PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload={
-                        "filename": filename,
-                        "title": chunk["title"],
-                        "text": chunk["text"],
-                        "situation": chunk.get("situation"),
-                        "chunk_idx": i,
-                        "language": _detect_language(chunk["text"]),
-                        "intent": chunk.get("intent", intent_slug),
-                        "intent_name": chunk.get("intent_name", intent_name),
-                        "situation_number": _extract_situation_number(chunk.get("title", "")),
-                    }
-                )
-            ]
-        )
-        print(f"  ✅ [{i + 1}/{len(chunks)}] {chunk['title']}")
+    return {"chunks_count": len(chunks)}
 
 
 async def ingest():
-    """Главная функция — заливает все файлы из data/docs/."""
-    print("🚀 Запуск ingestion...\n")
+    """Main ingestion function — processes all files from data/docs/ into LightRAG."""
+    print("🚀 Starting LightRAG ingestion...\n")
 
-    recreate_collection()
+    await lightrag_service.initialize()
 
     doc_path = "data/docs/"
     supported = (".pdf", ".txt", ".md", ".docx")
     files = [f for f in os.listdir(doc_path) if f.lower().endswith(supported)]
 
     if not files:
-        print("⚠️  Файлы не найдены в data/docs/")
+        print("⚠️  No files found in data/docs/")
         return
 
-    print(f"📁 Найдено файлов: {len(files)}")
+    print(f"📁 Found {len(files)} files")
 
     for filename in files:
         filepath = os.path.join(doc_path, filename)
         await ingest_file(filepath, filename)
 
-    print("\n🎉 Ingestion завершён!")
+    print("\n🎉 Ingestion complete!")
 
 
 if __name__ == "__main__":
