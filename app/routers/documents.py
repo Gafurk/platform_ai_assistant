@@ -4,6 +4,8 @@ import uuid
 import asyncio
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from app.services.task_queue import ingestion_queue
+from app.utils.logger import log_document_upload, log_ingestion_start, log_ingestion_complete, log_ingestion_error
 
 router = APIRouter()
 
@@ -26,17 +28,27 @@ async def upload_document(file: UploadFile = File(...)):
     safe_filename = f"{uuid.uuid4().hex}_{file.filename}"
     file_path = os.path.join(DOCS_DIR, safe_filename)
 
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    # Run ingestion in background
-    asyncio.create_task(_run_ingestion(file_path, safe_filename))
+        file_size_kb = os.path.getsize(file_path) / 1024
+        log_document_upload(safe_filename, round(file_size_kb, 1), "uploaded")
 
-    return JSONResponse(content={
-        "status": "uploaded",
-        "filename": safe_filename,
-        "message": "File uploaded. Ingestion started in background."
-    })
+        # Queue ingestion with concurrency limit
+        await ingestion_queue.submit(_run_ingestion(file_path, safe_filename))
+
+        queue_status = await ingestion_queue.get_status()
+        return JSONResponse(content={
+            "status": "queued",
+            "filename": safe_filename,
+            "message": f"File queued for ingestion. Active: {queue_status['active_tasks']}, Queued: {queue_status['queued_tasks']}"
+        })
+    except Exception as e:
+        log_document_upload(safe_filename, 0, f"failed: {str(e)}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
 @router.get("/documents")
@@ -72,9 +84,13 @@ async def delete_document(filename: str):
 
 async def _run_ingestion(filepath: str, filename: str):
     """Run ingestion for a single file."""
+    log_ingestion_start(filename)
     try:
         from ingestion.ingest import ingest_file
-        await ingest_file(filepath, filename)
-        print(f" Ingestion complete for: {filename}")
+        result = await ingest_file(filepath, filename)
+        chunks_count = result.get("chunks_count", 0) if isinstance(result, dict) else 0
+        log_ingestion_complete(filename, chunks_count, "success")
+        print(f"✅ Ingestion complete for: {filename}")
     except Exception as e:
-        print(f" Ingestion failed for {filename}: {str(e)}")
+        log_ingestion_error(filename, str(e))
+        print(f"❌ Ingestion failed for {filename}: {str(e)}")

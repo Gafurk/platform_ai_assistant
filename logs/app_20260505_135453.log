@@ -1,0 +1,58 @@
+2026-05-05 13:54:55 - httpx - INFO - HTTP Request: GET http://localhost:6333 "HTTP/1.1 200 OK"
+2026-05-05 13:56:13 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:56:13 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:56:13 - root - INFO - RAG_SEARCH | intent=none | lang=ru | results=7 | query_len=30
+2026-05-05 13:56:18 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:56:18 - root - INFO - CHAT | session=demo-c5ipg3su8 | source=llm | msg_len=30
+2026-05-05 13:57:47 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:57:47 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:57:47 - root - INFO - RAG_SEARCH | intent=real_estate | lang=ru | results=6 | query_len=18
+2026-05-05 13:57:49 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:57:49 - root - INFO - CHAT | session=demo-ydrvz8ryx | source=llm | msg_len=2
+2026-05-05 13:58:01 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:58:01 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:58:01 - root - INFO - RAG_SEARCH | intent=real_estate | lang=ru | results=6 | query_len=26
+2026-05-05 13:58:03 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:58:03 - root - INFO - CHAT | session=demo-ydrvz8ryx | source=llm | msg_len=23
+2026-05-05 13:58:13 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:58:13 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:58:13 - root - INFO - RAG_SEARCH | intent=real_estate | lang=ru | results=6 | query_len=75
+2026-05-05 13:58:16 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:58:16 - root - INFO - CHAT | session=demo-ydrvz8ryx | source=llm | msg_len=51
+2026-05-05 13:58:20 - root - INFO - CHAT | session=demo-ydrvz8ryx | source=handoff | msg_len=14
+2026-05-05 13:58:43 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:58:43 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:58:43 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:58:43 - root - INFO - RAG_SEARCH | intent=tu_application | lang=kz | results=7 | query_len=26
+2026-05-05 13:58:46 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:58:46 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=10
+2026-05-05 13:59:11 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:59:11 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:11 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:11 - root - INFO - RAG_SEARCH | intent=tu_application | lang=ru | results=7 | query_len=13
+2026-05-05 13:59:13 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:59:13 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=2
+2026-05-05 13:59:31 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:59:31 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:31 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:31 - root - INFO - RAG_SEARCH | intent=tu_application | lang=ru | results=7 | query_len=14
+2026-05-05 13:59:33 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 13:59:33 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=11
+2026-05-05 13:59:58 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 13:59:58 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:58 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 13:59:58 - root - INFO - RAG_SEARCH | intent=tu_application | lang=ru | results=7 | query_len=34
+2026-05-05 14:00:01 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 14:00:01 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=22
+2026-05-05 14:00:10 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 14:00:10 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 14:00:10 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 14:00:10 - root - INFO - RAG_SEARCH | intent=tu_application | lang=ru | results=7 | query_len=25
+2026-05-05 14:00:12 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 14:00:12 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=2
+2026-05-05 14:00:21 - httpx - INFO - HTTP Request: POST http://localhost:11434/api/embeddings "HTTP/1.1 200 OK"
+2026-05-05 14:00:21 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 14:00:21 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/isel_docs/points/query "HTTP/1.1 200 OK"
+2026-05-05 14:00:21 - root - INFO - RAG_SEARCH | intent=tu_application | lang=ru | results=7 | query_len=29
+2026-05-05 14:00:36 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-05-05 14:00:36 - root - INFO - CHAT | session=demo-wlki2tyjw | source=llm | msg_len=26
