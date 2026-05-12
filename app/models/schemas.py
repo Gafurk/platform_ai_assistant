@@ -15,8 +15,14 @@ class ChatResponse(BaseModel):
     handoff: bool = False
 
 
-class SessionState(BaseModel):
+class FlowState(BaseModel):
+    """Per-session flow state persisted in SessionManager."""
     intent: Optional[str] = None
     entity: Optional[str] = None
-    step: Optional[int] = None
-    situation: Optional[int] = None
+    step: Optional[int] = None       # linear flows (TU)
+    situation: Optional[int] = None  # scenario flows (Real Estate)
+    locked: bool = False             # True once a flow is underway
+
+
+# Backward-compat alias — remove after all callers updated
+SessionState = FlowState
