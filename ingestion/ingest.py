@@ -167,7 +167,10 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
         if (has_page or has_steps or has_bullets) and content_length > 150:
             filtered.append(chunk)
         else:
-            print(f"  🗑️  Filtered low-quality chunk: {title[:60]}")
+            try:
+                print(f"  Filtered low-quality chunk: {title[:60]}")
+            except:
+                pass
 
     return filtered
 

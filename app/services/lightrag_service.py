@@ -62,6 +62,7 @@ rag = LightRAG(
     ),
     chunk_token_size=1200,
     chunk_overlap_token_size=100,
+    rerank_model_func=None,
 )
 
 
@@ -82,6 +83,7 @@ async def search_docs(
     entity: str = None,
     page: str = None,
     language: str = None,
+    current_step: int = None,
 ) -> str:
     """
     Search the knowledge graph for context.
@@ -93,19 +95,22 @@ async def search_docs(
         entity: "физическое лицо" or "юридическое лицо" (prepended to query)
         page: Page context (not directly used, kept for API compatibility)
         language: "ru" or "kz" (kept for future language-specific filtering)
+        current_step: Current step number for multi-step processes (prepended to query)
 
     Returns:
         Formatted context string for the LLM
     """
     try:
-        # Prepend intent and entity to query for graph extraction
+        # Prepend step, intent, and entity to query for graph extraction
         enriched_query = query
+        if current_step is not None:
+            enriched_query = f"[Шаг {current_step}] {enriched_query}"
         if intent:
             enriched_query = f"[{intent}] {enriched_query}"
         if entity:
             enriched_query = f"[{entity}] {enriched_query}"
 
-        print(f"DEBUG — LightRAG query: intent={intent}, entity={entity}, lang={language}, q_len={len(query)}")
+        print(f"DEBUG — LightRAG query: step={current_step}, intent={intent}, entity={entity}, lang={language}, q_len={len(query)}")
 
         # Query knowledge graph with only_need_context=True
         # This returns raw context without LLM generation
