@@ -15,13 +15,13 @@ class ScenarioFlow(BaseFlow):
 
     def build_query(self, ctx: FlowContext) -> str:
         entity = ctx.state.entity or ""
-        # Include last user turn for context continuity — ensures clarification answers
-        # land in the right retrieval space without dropping entity grounding.
         if ctx.history:
-            last_user = next(
-                (m["content"] for m in reversed(ctx.history) if m["role"] == "user"),
-                "",
-            )
-            if last_user:
-                return f"{entity} {last_user} {ctx.message}".strip()
+            user_msgs = [m["content"] for m in ctx.history if m["role"] == "user"]
+            if user_msgs:
+                best = max(user_msgs, key=len)
+                # Use the richest historical message as semantic anchor only when the
+                # current message is a short clarification reply (e.g. "ЖТ", "ЗТ").
+                # This prevents the original intent question from being lost.
+                if len(best) > len(ctx.message) * 2:
+                    return f"{entity} {best} {ctx.message}".strip()
         return f"{entity} {ctx.message}".strip()

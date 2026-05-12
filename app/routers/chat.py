@@ -47,8 +47,16 @@ _SHARED_STEPS = frozenset({"шаг 2", "шаг 3", "шаг 4", "шаг 5"})
 # Pure helpers
 # ---------------------------------------------------------------------------
 
-def _detect_language(message: str) -> str:
-    return "kz" if any(ch in _KZ_CHARS for ch in message) else "ru"
+def _detect_language(message: str, history: list[dict] | None = None) -> str:
+    if any(ch in _KZ_CHARS for ch in message):
+        return "kz"
+    # Short answers like "ЖТ", "да", "иә" lack Kazakh chars — inherit from the last
+    # substantive user message in history so language doesn't flip mid-session.
+    if history and len(message.strip()) <= 10:
+        for msg in reversed(history):
+            if msg["role"] == "user" and len(msg["content"]) > 3:
+                return "kz" if any(ch in _KZ_CHARS for ch in msg["content"]) else "ru"
+    return "ru"
 
 
 def _detect_entity(message: str, history: list[dict]) -> Optional[str]:
@@ -140,12 +148,7 @@ async def chat(request: ChatRequest):
     sessions.cleanup()
 
     # --- Rule-based shortcut (greetings, identity, handoff) ---
-    rule_answer, handoff = check_rule(request.message)
-    if handoff:
-        log_chat_request(request.session_id, request.message, "handoff")
-        return ChatResponse(
-            answer="Соединяю вас с оператором...", source="rule_based", handoff=True
-        )
+    rule_answer, _ = check_rule(request.message)
     if rule_answer:
         log_chat_request(request.session_id, request.message, "rule_based")
         return ChatResponse(answer=rule_answer, source="rule_based", handoff=False)
@@ -153,7 +156,7 @@ async def chat(request: ChatRequest):
     # --- Session load ---
     history = sessions.get_history(request.session_id)
     state = sessions.get_state(request.session_id)
-    lang = _detect_language(request.message)
+    lang = _detect_language(request.message, history)
 
     # --- Intent classification ---
     new_intent = classify_intent(request.message, request.page, state.intent)
