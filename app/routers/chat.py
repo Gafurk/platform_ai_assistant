@@ -47,8 +47,8 @@ _UL_PHRASES = [
     "юр лицо",
 ]
 
-_FL_EXACT = {"фл", "ф.л.", "физ", "физлицо", "физ лицо"}
-_UL_EXACT = {"юл", "ю.л.", "юр", "юрлицо", "юр лицо"}
+_FL_EXACT = {"фл", "ф.л.", "физ", "физлицо", "физ лицо", "жт", "ж.т."}
+_UL_EXACT = {"юл", "ю.л.", "юр", "юрлицо", "юр лицо", "зт", "з.т."}
 
 _TU_KEYWORDS = [" ту ", "технические условия", " тқ ", "техникалық шарттар", "техусловия"]
 _RE_KEYWORDS = ["объект недвижимости", "добавить объект", "добавление объекта", "кадастр"]
@@ -57,6 +57,13 @@ _TU_PAGE_KEYWORDS = ["технических условий", "техуслов�
 _RE_PAGE_KEYWORDS = ["объект недвижимости", "объекты недвижимости", "добавление объекта"]
 
 _SHARED_STEPS = ["шаг 2", "шаг 3", "шаг 4", "шаг 5"]
+
+_TU_MAX_STEPS = 5
+_NEXT_STEP_PHRASES = {
+    "дальше", "далее", "следующий", "следующий шаг",
+    "продолжай", "продолжи", "давай", "да",
+    "келесі", "жалғастыр", "ары қарай",
+}
 
 def _clarification_question(lang: str) -> str:
     if lang == "kz":
@@ -129,6 +136,11 @@ def _detect_language(message: str) -> str:
     return "ru"
 
 
+def _is_next_step_request(message: str) -> bool:
+    """Check if user is asking for the next step."""
+    return message.strip().lower() in _NEXT_STEP_PHRASES
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
@@ -171,9 +183,11 @@ async def chat(request: ChatRequest):
     detected_lang = _detect_language(request.message)
 
     previous_intent = state.intent
+    previous_entity = state.entity
     state.intent = _classify_intent(request.message, request.page, state)
     if state.intent is not None and state.intent != previous_intent:
         state.entity = None
+        state.step = None
 
     if state.entity is None:
         state.entity = _detect_entity(request.message, history)
@@ -182,6 +196,29 @@ async def chat(request: ChatRequest):
 
     if _needs_entity_clarification(state.intent, entity, request.page):
         return ChatResponse(answer=_clarification_question(detected_lang), source="rule_based", handoff=False)
+
+    if state.intent == "tu_application":
+        is_entity_fix = (state.entity is not None) and (previous_entity is None)
+        is_next = _is_next_step_request(request.message) and state.step is not None
+
+        if is_entity_fix and state.step is None:
+            old_step = state.step
+            state.step = 1
+            print(f"[State] Entity fixed → Step {old_step} -> 1")
+
+        elif is_next:
+            old_step = state.step
+            state.step = min(state.step + 1, _TU_MAX_STEPS)
+            if old_step != state.step:
+                print(f"[State] Step transition: {old_step} -> {state.step}")
+            else:
+                print(f"[State] Step capped at max: {_TU_MAX_STEPS}")
+
+        elif state.step is None and state.entity is not None:
+            state.step = 1
+            print(f"[State] TU intent initialized → Step None -> 1")
+    else:
+        state.step = None
 
     if entity and history:
         last_user = next(
@@ -202,15 +239,15 @@ async def chat(request: ChatRequest):
     else:
         question_for_llm = request.message
 
-    print(f"DEBUG — intent: {state.intent}, entity: {entity}")
+    print(f"DEBUG — intent: {state.intent}, entity: {entity}, step: {state.step}")
     print(f"DEBUG — detected_lang: {detected_lang}")
     print(f"DEBUG — enriched_query: {enriched_query}")
 
-    context = await search_docs(enriched_query, intent=state.intent, entity=entity, language=detected_lang)
+    context = await search_docs(enriched_query, intent=state.intent, entity=entity, language=detected_lang, current_step=state.step)
 
     history_text = ""
     if history:
-        for msg in history[-4:]:
+        for msg in history[-6:]:
             role = "Пользователь" if msg["role"] == "user" else "Ассистент"
             history_text += f"{role}: {msg['content']}\n"
 
@@ -218,12 +255,12 @@ async def chat(request: ChatRequest):
     answer = await ask_llm(
         question_for_llm, context_str,
         page=request.page, language=detected_lang, history=history_text,
-        intent=state.intent, entity=entity,
+        intent=state.intent, entity=entity, current_step=state.step,
     )
 
     history.append({"role": "user", "content": request.message})
     history.append({"role": "assistant", "content": answer})
-    sessions[request.session_id] = history[-10:]
+    sessions[request.session_id] = history[-20:]
 
     log_chat_request(request.session_id, request.message, "llm")
     return ChatResponse(answer=answer, source="llm", handoff=False)
