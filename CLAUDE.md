@@ -10,13 +10,16 @@ venv/Scripts/activate             # bash/Git Bash
 venv\Scripts\Activate.ps1         # PowerShell
 
 # Install dependencies (one-time)
-pip install lightrag-hku openai
+pip install lightrag-hku openai pypdf python-docx
 
 # Start the API server
 uvicorn app.main:app --reload --port 8001
 
 # Ingest documents into LightRAG
 python ingestion/ingest.py
+
+# Run tests
+python -m pytest tests/ -v
 ```
 
 ## External services
@@ -32,93 +35,159 @@ The working directory `./data/lightrag/` is created automatically on first run.
 
 ```
 OPENAI_API_KEY=sk-...       # Required — your OpenAI API key
-LLM_PROVIDER=openai         # "openai" only (ollama no longer supported)
+LLM_PROVIDER=openai         # "openai" only (ollama legacy, not recommended)
 OPENAI_MODEL=gpt-4.1-nano   # Model for both entity extraction and LLM responses
 ```
-
-Old Qdrant/Ollama variables are no longer used.
 
 ## Architecture
 
 FastAPI RAG-based AI assistant for the iSEL platform. Responds in Russian (RU) and Kazakh (KZ).
 
-**Demo UI:** `http://localhost:8001/static/index.html` — glassmorphism floating widget (FAB bottom-right) built with Flaticon Uicons and Inter font. No mobile styles.
+**Demo UI:** `http://localhost:8001/static/index.html` — glassmorphism floating widget (FAB bottom-right).
 
 **Health check:** `GET /health` returns `{"status": "ok", "service": "isel-bot"}`.
 
 ### Request pipeline (`POST /api/v1/chat`)
 
-Handled in `app/routers/chat.py`. Input: `ChatRequest(message, session_id, page?, language?)`.  
-Response: `ChatResponse(answer, source, handoff)` — `source` is `"rule_based"` or `"llm"`.
+```
+validate → rate_limit → rule_based → FAQ interruption? → intent classify
+→ entity detect → clarification gate → flow.next_state() → RAG → LLM
+```
 
-The `language` field in `ChatRequest` is accepted but **not used**. Language is auto-detected from the incoming `message` via `_detect_language()`, which checks for Kazakh-specific Cyrillic characters (ә ғ қ ң ө ұ ү і).
+Input: `ChatRequest(message, session_id, page?, language?)`.
+Response: `ChatResponse(answer, source, handoff)` — `source` is `"rule_based"`, `"faq_interruption"`, or `"llm"`.
 
-Sessions are **in-memory** (`sessions: dict[str, list[dict]] = {}` in `chat.py`) — lost on server restart.
+Language is **auto-detected** from the incoming `message` via `_detect_language()`, which checks for Kazakh-specific Cyrillic characters (ә ғ қ ң ө ұ ү і). The `language` field in `ChatRequest` is accepted but not used.
 
-1. **Rule-based filter** (`services/rulebased.py`)  
-   Keys in `SYSTEM_COMMANDS` are matched by longest-key-first substring search (prevents short keys shadowing longer ones). Covers greetings, identity, capability, off-topic deflection, and operator handoff in both RU and KZ (`привет`, `салем`, `спасибо`, `рахмет`, etc.). Returns early without hitting RAG or the LLM.
+Sessions are **in-memory** (lost on server restart). Managed by `app/services/session.py` `SessionManager`.
 
-2. **Entity detection and query enrichment** (`routers/chat.py`)  
-   `_detect_entity()` scans the current message and all prior user messages for FL/UL keywords in Russian (`физ`, `юр`, `фл`, `юл`, …) and Kazakh (`жеке`, `заңды`, `занды`) terms.  
-   - If entity found AND prior history exists: pairs last user question with current message for the RAG query (assumes current message is the clarification).  
-   - If entity found but no prior history: appends entity to the RAG query.  
-   - LLM always receives `[пользователь уже указал: {entity}]` appended to the question when entity is known.  
-   Session history is capped at 10 messages; last 4 are passed to the LLM as `history_text`.
+### Layer 1 — Rule-based filter (`services/rulebased.py`)
 
-3. **RAG retrieval** (`services/rag.py` → `services/lightrag_service.py`)  
-   Uses LightRAG's **knowledge graph-based retrieval** (`hybrid` mode):
-   - Query is enriched with intent (e.g., `[tu_application]`) and entity (e.g., `[физическое лицо]`)
-   - LightRAG extracts entities and relationships from documents using gpt-4.1-nano
-   - Retrieval combines **graph traversal** (follows relationships between concepts like steps, situations, buttons) with **vector similarity** (text-embedding-3-small, 1536-dim)
-   - Hybrid mode: local graph neighborhood + global community summaries
-   - Returns raw context string with `only_need_context=True` (no LLM generation inside LightRAG)
-   - Empty context falls back gracefully; router passes `"Контекст недоступен."` to the LLM if needed
+Two dictionaries checked before any RAG or LLM call:
 
-4. **LLM generation** (`services/llm_service.py`)  
-   `LLM_PROVIDER=ollama` → `_call_ollama` (POST `/api/generate`, stream=False, timeout 180 s).  
-   `LLM_PROVIDER=openai` → `_call_openai` (POST to OpenAI chat completions, timeout 30 s, max_tokens 1000).  
-   Temperature is `0.0` in both providers.  
-   System prompt uses XML tags (`<role>`, `<language_rule>`, `<history>`, `<rules>`, `<formatting>`).  
-   User prompt wraps input as `<context>`, `<question>`, `<answer>` — the open `<answer>` tag primes extraction.  
-   When `language="kz"`, `<language_rule>` mandates full Kazakh translation of Russian templates and forbids any Russian in the response.  
-   `<formatting>` includes a rule to strip guillemet/quote wrapping from button names and replace with `**bold**`.
+**`SYSTEM_COMMANDS`** — identity, greetings, handoff  
+Keys matched by longest-first substring search. Covers `привет`, `салем`, `спасибо`, `рахмет`, `оператор`, etc.
+
+**`NAVIGATION_RULES`** — canonical platform navigation paths  
+Exact answers for status/document/refusal queries — zero LLM tokens.
+
+| Trigger phrase | Answer |
+|---|---|
+| `статус заявки`, `статус обращения`, `где моя заявка` | Path to Услуги → Обращения |
+| `мотивированный отказ`, `скачать отказ` | Path + Скачать/Просмотр instruction |
+| `скачать технические условия`, `скачать тУ`, `готовые тУ` | Path + Скачать/Просмотр instruction |
+| Kazakh equivalents | Same answers in Kazakh |
+
+**Rule:** Do NOT add navigation paths to `app/flows/`. Flows are state machines. Navigation facts belong in `rulebased.py` (for exact matches) and `llm_service.py` `<navigation_facts>` (for contextual use).
+
+### Layer 2 — Flow engine (`app/flows/`)
+
+**`FlowState`** (in `models/schemas.py`): `intent`, `entity`, `step`, `situation`, `locked`
+
+**Flow types:**
+
+| Intent | Flow class | Behavior |
+|---|---|---|
+| `tu_application` | `LinearFlow` | 5 steps, entity required, step increments on "дальше"/"да"/etc. |
+| `real_estate` | `ScenarioFlow` | Branching situations, asks clarifying question, uses last-turn context in query |
+| `None` | `FAQFlow` | Pure retrieval, no state tracking |
+
+**FAQ interruption:** When `state.locked=True` and the message has no flow keywords and is not a step phrase, the system answers via `FAQFlow` without disturbing the active flow state. History-only update preserves the step position.
+
+**Intent locking:** Once step≥1 starts for TU or situation is active for real estate, `state.locked=True` prevents accidental intent resets.
+
+**`registry.py`** exports:
+- `get_flow(intent)` — returns the flow handler
+- `classify_intent(message, page, current_intent)` — sticky intent with explicit-switch override
+- `has_flow_keywords(message)` — used by FAQ interruption gate
+
+### Layer 3 — RAG retrieval (`services/rag.py` → `services/lightrag_service.py`)
+
+LightRAG `hybrid` mode — combines graph traversal + vector similarity.
+
+Query enrichment order: `[Шаг N]` → `[intent]` → `[entity]` → user message.
+
+`rerank_model_func=None` — reranking disabled (no reranker model available).
+
+Returns raw context string (`only_need_context=True`). Empty context falls back to `"Контекст недоступен."`.
+
+### Layer 4 — LLM generation (`services/llm_service.py`)
+
+**Prompt structure** (for OpenAI prefix caching):
+
+```
+_STATIC_PROMPT_RU / _STATIC_PROMPT_KZ   ← identical per language — cached by OpenAI
+  <role>
+  <language_rule>
+  <navigation_facts>                      ← canonical paths for status/documents
+  <intent_handling>
+  <rules> (13 rules)
+  <formatting>
+
+  + per-request dynamic suffix:
+  <history>         (if any)
+  <intent_context>  (if intent/entity/page set)
+  <step_control>    (if current_step set)
+    → step 5: includes navigation hint to Услуги → Обращения
+```
+
+Temperature `0.0`. Max tokens `1000`. Timeout `30s` (OpenAI) / `180s` (Ollama).
+
+### Session management (`services/session.py`)
+
+`SessionManager` has three update modes:
+
+| Method | When | Effect |
+|---|---|---|
+| `update()` | Normal LLM turn | State + history |
+| `update_state_only()` | Clarification gate (no bot message) | State only |
+| `update_history_only()` | FAQ interruption | History only (flow state preserved) |
+
+History capped at 20 entries (10 turns). `cleanup()` removes sessions idle > 24 hours.
 
 ### Document API (`routers/documents.py`)
 
-- `POST /api/v1/upload` — saves file with `{uuid}_{original_name}` to `data/docs/`, queues ingestion via `TaskQueue` (max 2 concurrent ingestions)
+- `POST /api/v1/upload` — saves file with `{uuid}_{original_name}` to `data/docs/`, queues ingestion via `TaskQueue` (max 2 concurrent)
 - `GET /api/v1/documents` — lists files in `data/docs/`
-- `DELETE /api/v1/documents/{filename}` — removes file from disk only (does **not** remove KG nodes from LightRAG; LightRAG keeps the graph as-is)
+- `DELETE /api/v1/documents/{filename}` — removes file from disk only (**does not** remove KG nodes from LightRAG)
 
 ### Ingestion pipeline (`ingestion/ingest.py`)
 
-`ingest()` initializes LightRAG (no collection wipe). Each run **incrementally adds** documents to the knowledge graph.
+Each run **incrementally adds** documents to the knowledge graph (no wipe).
 
 **Chunking strategy** (`split_by_situations()`):
-1. **Meta blocks** (`Цель интента`, `Описание интента`, `Мақсаты`, `Сипаттамасы`, `Требования`, `Талаптар`) — extracted first, added at the end (lower retrieval priority).
-2. **Situation blocks** (`Ситуация \d+`, `Жағдай \d+`) — each captures content until the next situation, including `Шаблон ответа`/`Жауап үлгісі` (content preserved, marker stripped). Ensures every block has both description and answer template.
-3. **Deduplication** — keeps chunk with more text content when same title appears twice.
-4. **Fallback** — fixed-size word chunking (800 words, 100-word overlap) if no situation headers found.
+1. **Situation blocks** (`Ситуация \d+`, `Жағдай \d+`) — each gets its own LightRAG insert with metadata header.
+2. **Meta blocks** (`Цель интента`, `Мақсаты`, `Требования`) — added at lower priority.
+3. **Fallback** — 800-word fixed chunks with 100-word overlap if no situation headers found.
 
-**Each chunk inserted into LightRAG** with metadata:
+Each chunk inserted with:
 ```
 [FILENAME: {filename}] [INTENT: {intent_slug}] [LANGUAGE: {language}] [TITLE: {title}]
 {chunk_text}
 ```
 
-LightRAG automatically:
-- Tokenizes by 1200-token chunks with 100-token overlap
-- Extracts entities and relations using gpt-4.1-nano
-- Embeds chunks with text-embedding-3-small (1536-dim)
-- Builds / updates the knowledge graph
-- Stores graph in `./data/lightrag/` (NetworkX + nano-vectordb)
-
 ## Key constraints
 
 - All packages under `app/` have `__init__.py` — do not delete them.
 - `frontend/` directory must exist before starting the server (`StaticFiles` mount fails otherwise).
-- `data/docs/` is the staging area for raw documents; deleting a file via the API does **not** clean up its nodes from the LightRAG knowledge graph.
-- `data/lightrag/` is the persistent storage for the knowledge graph — back this up; it contains all indexed content.
-- `ingest.py` supports `.pdf`, `.txt`, `.md`, `.docx` — all are parsed and sent to LightRAG as situation-level blocks.
-- LightRAG ingestion triggers gpt-4.1-nano calls for entity extraction — expect API costs (~0.5–2 USD per 100KB document).
-- No test suite yet — add pytest and document commands here when added.
-- `OPENAI_API_KEY` **must** be set in `.env` for the app to function (both LLM generation and embeddings use OpenAI).
+- `data/docs/` is the staging area for raw documents; deleting via API does **not** clean LightRAG KG nodes.
+- `data/lightrag/` is the persistent KG storage — **back this up**; it contains all indexed content.
+- LightRAG ingestion triggers gpt-4.1-nano calls — expect ~0.5–2 USD per 100KB document.
+- `OPENAI_API_KEY` **must** be set in `.env`.
+
+## Adding new navigation rules
+
+When a new platform path needs to be surfaced to users:
+
+1. Add the answer string to `rulebased.py` `NAVIGATION_RULES` dict.
+2. Add both Russian and Kazakh trigger phrases.
+3. If the path is relevant during LLM flows (not just direct questions), also add to `<navigation_facts>` in `llm_service.py` static prompts.
+4. Do **not** add navigation content to `app/flows/` — flows handle routing only.
+
+## Adding a new flow type
+
+1. Create `app/flows/myflow.py` inheriting `BaseFlow`.
+2. Override `next_state()`, `build_query()`, and optionally `is_step_progression()`.
+3. Register in `app/flows/registry.py` `_FLOWS` dict.
+4. Add intent keywords to `INTENT_KEYWORDS` in `registry.py`.
+5. Add tests in `tests/test_flows.py`.
