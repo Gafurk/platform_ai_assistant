@@ -8,6 +8,7 @@ async def search_docs(
     entity: str = None,
     page: str = None,
     language: str = None,
+    current_step: int = None,
 ) -> str:
     """
     Search the knowledge graph for context using LightRAG.
@@ -22,6 +23,7 @@ async def search_docs(
         entity: "физическое лицо" or "юридическое лицо"
         page: Page context (optional)
         language: "ru" or "kz"
+        current_step: Current step number for multi-step processes
 
     Returns:
         Context string formatted for the LLM
@@ -33,4 +35,5 @@ async def search_docs(
         entity=entity,
         page=page,
         language=language,
+        current_step=current_step,
     )
