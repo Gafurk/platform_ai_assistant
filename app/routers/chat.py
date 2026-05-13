@@ -13,6 +13,7 @@ from app.services.rag import search_docs
 from app.services.rate_limit import chat_limiter
 from app.services.rulebased import check_rule
 from app.services.session import sessions
+from app.services.translit import normalize_kz
 from app.services.validation import ValidationError, validate_message, validate_session_id
 from app.utils.logger import log_chat_request
 
@@ -23,6 +24,12 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 _KZ_CHARS = frozenset("әғқңөұүіӘҒҚҢӨҰҮІ")
+
+# Platform-specific entity abbreviations used only in Kazakh context.
+# They contain no KZ-specific chars so history-walk can't help when the
+# clarification gate fired (update_state_only skips history), so we
+# treat them as an unconditional KZ signal.
+_KZ_ENTITY_EXACT = frozenset({"жт", "зт", "ж.т.", "з.т."})
 
 _FL_PHRASES = [
     "физическое лицо", "физ лицо", "физлицо",
@@ -50,8 +57,12 @@ _SHARED_STEPS = frozenset({"шаг 2", "шаг 3", "шаг 4", "шаг 5"})
 def _detect_language(message: str, history: list[dict] | None = None) -> str:
     if any(ch in _KZ_CHARS for ch in message):
         return "kz"
-    # Short answers like "ЖТ", "да", "иә" lack Kazakh chars — inherit from the last
-    # substantive user message in history so language doesn't flip mid-session.
+    # KZ entity abbreviations (ЖТ/ЗТ) have no KZ chars but are exclusively
+    # used in Kazakh sessions. History walk can't help here because the
+    # clarification gate uses update_state_only (no history entry saved yet).
+    if message.strip().lower() in _KZ_ENTITY_EXACT:
+        return "kz"
+    # Short answers like "да", "иә" without KZ chars — inherit from history.
     if history and len(message.strip()) <= 10:
         for msg in reversed(history):
             if msg["role"] == "user" and len(msg["content"]) > 3:
@@ -96,7 +107,9 @@ def _needs_entity_clarification(
 ) -> bool:
     if entity is not None:
         return False
-    if intent not in ("real_estate", "tu_application"):
+    # Only TU application branches on entity type (ФЛ/ЮЛ have different forms).
+    # Real estate object addition is identical for all user types.
+    if intent != "tu_application":
         return False
     # Shared steps (2–5) work the same for both entity types — skip gate
     if page and any(step in page.lower() for step in _SHARED_STEPS):
@@ -156,6 +169,7 @@ async def chat(request: ChatRequest):
     # --- Session load ---
     history = sessions.get_history(request.session_id)
     state = sessions.get_state(request.session_id)
+    request.message = normalize_kz(request.message)
     lang = _detect_language(request.message, history)
 
     # --- Intent classification ---
@@ -193,11 +207,11 @@ async def chat(request: ChatRequest):
     # --- Intent update (only when not locked, or explicit switch) ---
     if new_intent != state.intent:
         if not state.locked:
-            # Fresh intent — reset all flow state
-            state = FlowState(intent=new_intent)
+            # Fresh intent — reset all flow state, capture original question
+            state = FlowState(intent=new_intent, original_question=request.message)
         # If locked, explicit keyword switch is still allowed
         elif new_intent is not None and new_intent != state.intent:
-            state = FlowState(intent=new_intent)
+            state = FlowState(intent=new_intent, original_question=request.message)
 
     # --- Entity detection ---
     if state.entity is None:
@@ -223,13 +237,14 @@ async def chat(request: ChatRequest):
     )
     state = flow.next_state(ctx)
 
-    # Lock once step is underway for tracked intents — prevents accidental resets
-    if (
-        not state.locked
-        and state.intent in ("tu_application", "real_estate")
-        and state.entity is not None
-        and (state.step is not None or state.situation is not None)
-    ):
+    # Lock once a flow is underway — prevents accidental intent resets.
+    # TU: requires entity + step to be set (ФЛ/ЮЛ branches differ from step 1).
+    # Real estate: locks as soon as the situation is chosen (no entity gate).
+    _can_lock = (
+        (state.intent == "tu_application" and state.entity is not None and state.step is not None)
+        or (state.intent == "real_estate" and state.situation is not None)
+    )
+    if not state.locked and _can_lock:
         state = state.model_copy(update={"locked": True})
 
     # --- RAG retrieval ---
@@ -259,6 +274,7 @@ async def chat(request: ChatRequest):
         intent=state.intent,
         entity=state.entity,
         current_step=state.step,
+        situation=state.situation,
     )
 
     sessions.update(request.session_id, state, request.message, answer)

@@ -20,8 +20,9 @@ class FlowState(BaseModel):
     intent: Optional[str] = None
     entity: Optional[str] = None
     step: Optional[int] = None       # linear flows (TU)
-    situation: Optional[int] = None  # scenario flows (Real Estate)
+    situation: Optional[str] = None  # scenario flows (Real Estate)
     locked: bool = False             # True once a flow is underway
+    original_question: Optional[str] = None  # first user message that triggered this intent
 
 
 # Backward-compat alias — remove after all callers updated
