@@ -3,25 +3,64 @@ from __future__ import annotations
 from app.flows.base import BaseFlow, FlowContext
 from app.models.schemas import FlowState
 
+# Maps explicit user choice phrases to a human-readable situation label.
+# The label is stored in FlowState.situation and passed to the LLM prompt.
+_SITUATION_KEYWORDS: dict[str, list[str]] = {
+    "через кадастровый номер": [
+        "кадастр арқылы", "кадастр аркылы", "через кадастр",
+        "по кадастру", "кадастрмен", "кадастровым номером",
+    ],
+    "через адресный регистр": [
+        "адресный регистр", "адрестік регистр",
+        "через адрес", "адрес арқылы", "адрес аркылы",
+        "мекенжай арқылы", "мекенжай аркылы", "адресный",
+    ],
+}
+
+# Question words that indicate the user is asking about something,
+# not making a situation choice — skip situation detection for these.
+_QUESTION_WORDS = frozenset({
+    "как", "где", "откуда", "что такое",
+    "қалай", "калай", "қайда", "кайда", "қайдан", "кайдан",
+    "как получить", "как узнать", "как найти",
+    "қалай алуға", "калай алуга", "қалай білуге",
+})
+
 
 class ScenarioFlow(BaseFlow):
     """Branching scenario flow (e.g. Real Estate — multiple situations)."""
 
     flow_type = "scenario"
-    requires_entity = True
+    requires_entity = False  # Real estate process is identical for ФЛ/ЮЛ
 
     def next_state(self, ctx: FlowContext) -> FlowState:
+        # Once situation is chosen, preserve it — never overwrite.
+        if ctx.state.situation is not None:
+            return ctx.state.model_copy()
+
+        msg_lower = ctx.message.lower()
+
+        # Questions are not situation choices ("как получить кадастровый номер"
+        # should not be treated as choosing the cadastral path).
+        if any(qw in msg_lower for qw in _QUESTION_WORDS):
+            return ctx.state.model_copy()
+
+        for situation_label, keywords in _SITUATION_KEYWORDS.items():
+            if any(kw in msg_lower for kw in keywords):
+                # Append the clarification answer to original_question so
+                # build_query includes the situation keyword for RAG retrieval.
+                oq = f"{ctx.state.original_question or ''} {ctx.message}".strip()
+                return ctx.state.model_copy(update={
+                    "situation": situation_label,
+                    "original_question": oq,
+                })
+
         return ctx.state.model_copy()
 
     def build_query(self, ctx: FlowContext) -> str:
         entity = ctx.state.entity or ""
-        if ctx.history:
-            user_msgs = [m["content"] for m in ctx.history if m["role"] == "user"]
-            if user_msgs:
-                best = max(user_msgs, key=len)
-                # Use the richest historical message as semantic anchor only when the
-                # current message is a short clarification reply (e.g. "ЖТ", "ЗТ").
-                # This prevents the original intent question from being lost.
-                if len(best) > len(ctx.message) * 2:
-                    return f"{entity} {best} {ctx.message}".strip()
-        return f"{entity} {ctx.message}".strip()
+        # Use the saved original question as the semantic anchor for RAG retrieval.
+        # After situation is detected, original_question includes the user's
+        # situational answer (e.g. "кадастр"), so RAG finds the right chunks.
+        base = ctx.state.original_question or ctx.message
+        return f"{entity} {base}".strip()

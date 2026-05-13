@@ -107,20 +107,61 @@ class TestScenarioFlow:
         q = self.flow.build_query(ctx("добавить объект", state=state))
         assert "юридическое лицо" in q
 
-    def test_query_includes_last_user_turn_from_history(self):
+    def test_query_uses_original_question_as_anchor(self):
+        state = FlowState(entity="физическое лицо",
+                          original_question="жылжымайтын мүлікті қалай қосуға болады?")
+        q = self.flow.build_query(ctx("ЖТ", state=state))
+        assert "жылжымайтын мүлікті қалай қосуға болады?" in q
+        assert "физическое лицо" in q
+
+    def test_query_falls_back_to_message_without_original_question(self):
         state = FlowState(entity="физическое лицо")
-        history = [
-            {"role": "user", "content": "через адрес или кадастр?"},
-            {"role": "assistant", "content": "Уточните: через адрес"},
-        ]
-        q = self.flow.build_query(ctx("через адрес", state=state, history=history))
-        assert "через адрес или кадастр?" in q
+        q = self.flow.build_query(ctx("добавить объект", state=state))
+        assert "добавить объект" in q
         assert "физическое лицо" in q
 
     def test_no_history_uses_message_only(self):
         state = FlowState(entity="физическое лицо")
         q = self.flow.build_query(ctx("добавить объект", state=state, history=[]))
         assert "добавить объект" in q
+
+    # --- next_state / situation detection ---
+
+    def test_cadastre_keyword_sets_situation_cadastre(self):
+        state = FlowState(intent="real_estate", original_question="объект косу")
+        new = self.flow.next_state(ctx("кадастр арқылы", state=state))
+        assert new.situation == "через кадастровый номер"
+
+    def test_address_keyword_sets_situation_address(self):
+        state = FlowState(intent="real_estate", original_question="объект косу")
+        new = self.flow.next_state(ctx("адресный регистр", state=state))
+        assert new.situation == "через адресный регистр"
+
+    def test_situation_answer_appended_to_original_question(self):
+        state = FlowState(intent="real_estate", original_question="объект косу")
+        new = self.flow.next_state(ctx("кадастр арқылы", state=state))
+        assert "объект косу" in new.original_question
+        assert "кадастр арқылы" in new.original_question
+
+    def test_situation_not_overwritten_once_set(self):
+        state = FlowState(intent="real_estate", situation="через кадастровый номер")
+        new = self.flow.next_state(ctx("адресный регистр", state=state))
+        assert new.situation == "через кадастровый номер"  # must not switch
+
+    def test_unknown_answer_preserves_none_situation(self):
+        state = FlowState(intent="real_estate")
+        new = self.flow.next_state(ctx("не знаю", state=state))
+        assert new.situation is None
+
+    def test_question_about_cadastre_does_not_set_situation(self):
+        state = FlowState(intent="real_estate")
+        new = self.flow.next_state(ctx("как получить кадастровый номер?", state=state))
+        assert new.situation is None
+
+    def test_question_about_cadastre_kz_does_not_set_situation(self):
+        state = FlowState(intent="real_estate")
+        new = self.flow.next_state(ctx("кадастрлық нөмірді қалай алуға болады?", state=state))
+        assert new.situation is None
 
 
 # ===========================================================================
@@ -192,7 +233,8 @@ class TestHasFlowKeywords:
 
     def test_re_keywords(self):
         assert has_flow_keywords("объект недвижимости")
-        assert has_flow_keywords("кадастр")
+        assert has_flow_keywords("кадастровый номер")
+        assert not has_flow_keywords("кадастр")  # bare "кадастр" no longer triggers
 
     def test_no_keywords(self):
         assert not has_flow_keywords("как зарегистрироваться")
