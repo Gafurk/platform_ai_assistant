@@ -55,10 +55,11 @@ def _extract_page_context(text: str) -> str | None:
 
 
 def _slug_intent(intent_name: str | None, filename: str) -> tuple[str, str]:
-    combined = ((intent_name or "") + " " + filename).lower()
+    # Space-padded so " ту " and " тқ " don't match inside longer words
+    combined = " " + ((intent_name or "") + " " + filename).lower() + " "
     if "недвижим" in combined:
         return "real_estate", "Добавление объекта недвижимости"
-    if any(kw in combined for kw in ["технические", "техусловия", "туслов"]):
+    if any(kw in combined for kw in ["технические", "техусловия", "туслов", " ту ", " тқ "]):
         return "tu_application", "Заявление на технические условия"
     return "general", re.sub(r'\.[^.]+$', '', filename)
 
@@ -117,12 +118,23 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
                 content_clean = re.sub(r'Шаблон ответа:?\s*|Жауап үлгісі:?\s*|Ответ бота:\s*', '', content).strip()
                 full_chunk = f"{situation_title}\n\n{content_clean}"
 
+                # Refine intent from the situation title when the file-level
+                # slug is "general" (e.g. "Общие вопросы" file containing
+                # TU or real-estate situations).
+                chunk_intent = intent_slug
+                chunk_display = intent_display
+                if intent_slug == "general":
+                    refined, refined_display = _slug_intent(situation_title, filename)
+                    if refined != "general":
+                        chunk_intent = refined
+                        chunk_display = refined_display
+
                 chunks.append({
                     "title": situation_title,
                     "text": full_chunk,
                     "situation": situation_title,
-                    "intent": intent_slug,
-                    "intent_name": intent_display,
+                    "intent": chunk_intent,
+                    "intent_name": chunk_display,
                 })
             i += 2
         else:
