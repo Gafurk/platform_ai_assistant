@@ -142,6 +142,12 @@ _TRANSLIT_MAP: dict[str, str] = {
     "кашан":                    "қашан",
     "ким":                      "кім",
 
+    # Common conversational verbs / verb forms
+    "парольди":                 "парольді",   # accusative of "пароль"
+    "умытып":                   "ұмытып",     # gerund: forgot (ұмыту)
+    "калдым":                   "қалдым",     # past: remained / got (stuck)
+    "шыгып":                    "шығып",      # gerund: exiting (шығу)
+
     # Verbs
     "тусинбедим":               "түсінбедім",
     "тусиндиру":                "түсіндіру",

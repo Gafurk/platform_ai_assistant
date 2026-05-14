@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from app.flows.base import BaseFlow, FlowContext
 from app.models.schemas import FlowState
+
+# To see these debug logs set the root logger level to DEBUG in app/utils/logger.py
+_log = logging.getLogger(__name__)
 
 # Maps explicit user choice phrases to a human-readable situation label.
 # The label is stored in FlowState.situation and passed to the LLM prompt.
@@ -34,27 +39,33 @@ class ScenarioFlow(BaseFlow):
     requires_entity = False  # Real estate process is identical for ФЛ/ЮЛ
 
     def next_state(self, ctx: FlowContext) -> FlowState:
+        _log.debug("ScenarioFlow.next_state | msg=%r | situation=%r", ctx.message, ctx.state.situation)
+
         # Once situation is chosen, preserve it — never overwrite.
         if ctx.state.situation is not None:
+            _log.debug("  → situation already set, skipping detection")
             return ctx.state.model_copy()
 
         msg_lower = ctx.message.lower()
 
         # Questions are not situation choices ("как получить кадастровый номер"
         # should not be treated as choosing the cadastral path).
-        if any(qw in msg_lower for qw in _QUESTION_WORDS):
+        matched_qw = next((qw for qw in _QUESTION_WORDS if qw in msg_lower), None)
+        if matched_qw:
+            _log.debug("  → question-word guard fired on %r, no situation set", matched_qw)
             return ctx.state.model_copy()
 
         for situation_label, keywords in _SITUATION_KEYWORDS.items():
-            if any(kw in msg_lower for kw in keywords):
-                # Append the clarification answer to original_question so
-                # build_query includes the situation keyword for RAG retrieval.
+            matched_kw = next((kw for kw in keywords if kw in msg_lower), None)
+            if matched_kw:
+                _log.debug("  → matched keyword %r → situation=%r", matched_kw, situation_label)
                 oq = f"{ctx.state.original_question or ''} {ctx.message}".strip()
                 return ctx.state.model_copy(update={
                     "situation": situation_label,
                     "original_question": oq,
                 })
 
+        _log.debug("  → no keyword matched, situation remains None")
         return ctx.state.model_copy()
 
     def build_query(self, ctx: FlowContext) -> str:
