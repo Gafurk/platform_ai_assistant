@@ -59,13 +59,29 @@ def _slug_intent(intent_name: str | None, filename: str) -> tuple[str, str]:
     combined = " " + ((intent_name or "") + " " + filename).lower() + " "
     if "недвижим" in combined:
         return "real_estate", "Добавление объекта недвижимости"
+    if any(kw in combined for kw in ["расчет нагрузки", "расчёт нагрузки", "жүктеме есебі"]):
+        return "load_calculation", "Расчёт электрической нагрузки"
+    if any(kw in combined for kw in ["эскизный", "эскиздік жоба"]):
+        return "draft_design", "Разработка эскизного проекта"
+    if any(kw in combined for kw in ["строительно-монтажн", "құрылыс-монтаж"]):
+        return "construction_works", "Строительно-монтажные работы"
+    if any(kw in combined for kw in ["первичное подключение", "первичное тех", "первичка",
+                                      "бастапқы қосылу", "алғашқы қосылу"]):
+        return "primary_connection", "Первичное подключение"
     if any(kw in combined for kw in ["технические", "техусловия", "туслов", " ту ", " тқ "]):
         return "tu_application", "Заявление на технические условия"
+    if any(kw in combined for kw in ["договор бытов", "договор небытов"]):
+        return "supply_contract", "Договор электроснабжения"
+    if "пломб" in combined:
+        return "meter_sealing", "Установка/снятие пломбы"
     return "general", re.sub(r'\.[^.]+$', '', filename)
 
 
 def _extract_situation_number(title: str) -> int | None:
     m = re.search(r'(?:Ситуация|Жағдай)\s+(\d+)', title)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'Шаг\s+(\d+)', title)
     if m:
         return int(m.group(1))
     m = re.search(r'^(\d+)\.\d+', title.strip())
@@ -76,7 +92,7 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
     """Splits document text into semantic situation chunks."""
     intent_slug, intent_display = _slug_intent(_extract_intent_name(text), filename)
 
-    situation_pattern = r'(Ситуация\s+\d+[^\n]*|Жағдай\s+\d+[^\n]*|\d+\.\d+\s+[А-ЯЁ][^\n]*)'
+    situation_pattern = r'(Ситуация\s+\d+[^\n]*|Жағдай\s+\d+[^\n]*|Шаг\s+\d+[^\n]*|\d+\.\d+\s+[А-ЯЁ][^\n]*)'
     meta_pattern = r'(Цель интента|Описание интента|Когда активируется интент|Сценарии и ответы|Мақсаты|Сипаттамасы|Требования[^\n]*|Талаптар[^\n]*)'
 
     chunks = []
@@ -106,7 +122,7 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
     while i < len(situation_blocks):
         part = situation_blocks[i].strip()
 
-        if re.match(r'(Ситуация\s+\d+|Жағдай\s+\d+|\d+\.\d+\s+[А-ЯЁ])', part):
+        if re.match(r'(Ситуация\s+\d+|Жағдай\s+\d+|Шаг\s+\d+|\d+\.\d+\s+[А-ЯЁ])', part):
             situation_title = part
             content = situation_blocks[i + 1].strip() if i + 1 < len(situation_blocks) else ""
 
@@ -145,7 +161,7 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
     seen: dict[str, int] = {}
     for i, chunk in enumerate(chunks):
         title = chunk["title"]
-        match = re.match(r'(Ситуация\s+\d+|Жағдай\s+\d+|\d+\.\d+)', title)
+        match = re.match(r'(Ситуация\s+\d+|Жағдай\s+\d+|Шаг\s+\d+|\d+\.\d+)', title)
         norm_key = match.group(1) if match else title[:60].strip()
 
         if norm_key not in seen:

@@ -31,6 +31,24 @@ _KZ_CHARS = frozenset("әғқңөұүіӘҒҚҢӨҰҮІ")
 # treat them as an unconditional KZ signal.
 _KZ_ENTITY_EXACT = frozenset({"жт", "зт", "ж.т.", "з.т."})
 
+# Words that indicate the user wants to find/view/download rather than fill a form.
+# Matched as substrings to handle inflected forms (статуса, документов, …).
+_NAVIGATION_TRIGGERS = frozenset({
+    # Russian
+    "статус", "посмотреть", "где", "скачать", "документ",
+    "готовое", "найти", "проверить",
+    # Kazakh
+    "мәртебе", "күй", "қайда", "қарау", "жүктеу", "дайын", "табу", "тексеру",
+})
+
+# Words that indicate form-filling — suppress the navigation shortcut when present.
+# Includes the user-supplied list plus "ввести"/"указать" to prevent false positives
+# on queries like "где ввести ИИН" or "где указать адрес".
+_NAVIGATION_FILL_EXCLUSIONS = frozenset({
+    "заполнить", "шаг", "подать", "создать",
+    "ввести", "указать",
+})
+
 _FL_PHRASES = [
     "физическое лицо", "физ лицо", "физлицо",
     "физического лица", "физическим лицом",
@@ -50,9 +68,34 @@ _UL_EXACT = frozenset({"юл", "ю.л.", "юр", "юрлицо", "юр лицо"
 # Steps that are shared between FL and UL — entity clarification not needed
 _SHARED_STEPS = frozenset({"шаг 2", "шаг 3", "шаг 4", "шаг 5"})
 
+# Russian function/pronoun words that strongly signal a Russian message.
+# Matched whole-word (space-padded) to avoid false positives inside longer words.
+_RU_FUNCTION_WORDS = frozenset({
+    "где", "как", "что", "когда", "почему", "куда",
+    "чей", "кто", "я", "мой", "подал",
+})
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+def _safe_normalize_kz(message: str) -> str:
+    """Apply Kazakh transliteration, reverting if KZ chars are introduced into a Russian message.
+
+    normalize_kz maps some Russian-looking substrings (e.g. "тех условие") to
+    proper Kazakh Cyrillic, which causes _detect_language to misidentify the
+    message as Kazakh. Guard: if the original had no KZ chars but normalized
+    has them AND the original contains Russian function words, revert.
+    """
+    if any(ch in _KZ_CHARS for ch in message):
+        return message  # already proper KZ — nothing to transliterate
+    normalized = normalize_kz(message)
+    if any(ch in _KZ_CHARS for ch in normalized):
+        padded = " " + message.lower() + " "
+        if any((" " + w + " ") in padded for w in _RU_FUNCTION_WORDS):
+            return message  # revert: normalization corrupted a Russian message
+    return normalized
+
 
 def _detect_language(message: str, history: list[dict] | None = None) -> str:
     if any(ch in _KZ_CHARS for ch in message):
@@ -135,6 +178,18 @@ def _annotate_question(message: str, entity: Optional[str], lang: str) -> str:
     return f"{message} {ann}"
 
 
+def _is_navigation_query(message: str) -> bool:
+    """True if the message looks like a status/download/find query rather than form-filling.
+
+    Fires when ANY navigation trigger is present and NO form-filling exclusion word
+    is present. Substring matching handles inflected forms naturally.
+    """
+    lower = message.lower()
+    if not any(t in lower for t in _NAVIGATION_TRIGGERS):
+        return False
+    return not any(e in lower for e in _NAVIGATION_FILL_EXCLUSIONS)
+
+
 # ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
@@ -169,11 +224,32 @@ async def chat(request: ChatRequest):
     # --- Session load ---
     history = sessions.get_history(request.session_id)
     state = sessions.get_state(request.session_id)
-    request.message = normalize_kz(request.message)
+    request.message = _safe_normalize_kz(request.message)
     lang = _detect_language(request.message, history)
 
     # --- Intent classification ---
     new_intent = classify_intent(request.message, request.page, state.intent)
+
+    # --- Navigation FAQ shortcut ---
+    # Intercepts status/download queries before the clarification gate and flow engine.
+    # Handles both fresh sessions (avoids ФЛ/ЮЛ gate) and locked flows (catches flow-keyword
+    # queries like "скачать ту" that the FAQ-interruption gate below would miss).
+    # update_history_only preserves state so the user can resume form-filling afterwards.
+    if _is_navigation_query(request.message):
+        nav_context = await search_docs(request.message, intent=None, entity=None, language=lang)
+        nav_answer = await ask_llm(
+            request.message,
+            nav_context if nav_context else "Контекст недоступен.",
+            language=lang,
+            history=_build_history_text(history),
+            intent=None,
+            entity=None,
+            current_step=None,
+            situation=None,
+        )
+        sessions.update_history_only(request.session_id, request.message, nav_answer)
+        log_chat_request(request.session_id, request.message, "faq_interruption")
+        return ChatResponse(answer=nav_answer, source="llm", handoff=False)
 
     # --- FAQ interruption: locked flow + no flow keywords + not a step phrase ---
     # Answer the FAQ question without disturbing the active flow state.
