@@ -109,6 +109,12 @@ async def search_docs(
             enriched_query = f"[{intent}] {enriched_query}"
         if entity:
             enriched_query = f"[{entity}] {enriched_query}"
+            # Append entity-specific terms to help LightRAG disambiguate
+            # ФЛ vs ЮЛ chunks when both exist for the same step.
+            if "юридическое" in entity:
+                enriched_query += " БИН организация руководитель"
+            elif "физическое" in entity:
+                enriched_query += " ФИО ИИН"
 
         print(f"DEBUG — LightRAG query: step={current_step}, intent={intent}, entity={entity}, lang={language}, q_len={len(query)}")
 
