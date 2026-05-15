@@ -65,9 +65,6 @@ def _slug_intent(intent_name: str | None, filename: str) -> tuple[str, str]:
         return "draft_design", "Разработка эскизного проекта"
     if any(kw in combined for kw in ["строительно-монтажн", "құрылыс-монтаж"]):
         return "construction_works", "Строительно-монтажные работы"
-    if any(kw in combined for kw in ["первичное подключение", "первичное тех", "первичка",
-                                      "бастапқы қосылу", "алғашқы қосылу"]):
-        return "primary_connection", "Первичное подключение"
     if any(kw in combined for kw in ["технические", "техусловия", "туслов", " ту ", " тқ "]):
         return "tu_application", "Заявление на технические условия"
     if any(kw in combined for kw in ["договор бытов", "договор небытов"]):

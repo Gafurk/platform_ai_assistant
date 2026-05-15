@@ -68,33 +68,36 @@ _UL_EXACT = frozenset({"юл", "ю.л.", "юр", "юрлицо", "юр лицо"
 # Steps that are shared between FL and UL — entity clarification not needed
 _SHARED_STEPS = frozenset({"шаг 2", "шаг 3", "шаг 4", "шаг 5"})
 
-# Russian function/pronoun words that strongly signal a Russian message.
-# Matched whole-word (space-padded) to avoid false positives inside longer words.
-_RU_FUNCTION_WORDS = frozenset({
-    "где", "как", "что", "когда", "почему", "куда",
-    "чей", "кто", "я", "мой", "подал",
-})
-
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
 
-def _safe_normalize_kz(message: str) -> str:
-    """Apply Kazakh transliteration, reverting if KZ chars are introduced into a Russian message.
+_RU_INDICATORS = (
+    " где ", " как ", " что ", " когда ", " почему ", " куда ",
+    " кто ", " я ", " мой ", " подал ", " нужно ", " указать ",
+    " заполнить ", " сведения ", " какие ",
+)
 
-    normalize_kz maps some Russian-looking substrings (e.g. "тех условие") to
-    proper Kazakh Cyrillic, which causes _detect_language to misidentify the
-    message as Kazakh. Guard: if the original had no KZ chars but normalized
-    has them AND the original contains Russian function words, revert.
+
+def _safe_normalize_kz(message: str) -> str:
+    """Transliterate Kazakh written in Russian letters, guard against Russian corruption.
+
+    1. Already has KZ chars → normalize (mixed input from KZ keyboard).
+    2. Contains Russian function/content words → don't transliterate.
+    3. Might be Kazakh transliteration → try normalize, accept only if KZ chars appear.
+    4. Otherwise → return original unchanged.
     """
     if any(ch in _KZ_CHARS for ch in message):
-        return message  # already proper KZ — nothing to transliterate
+        return normalize_kz(message)
+
+    padded = " " + message.lower() + " "
+    if any(ind in padded for ind in _RU_INDICATORS):
+        return message
+
     normalized = normalize_kz(message)
     if any(ch in _KZ_CHARS for ch in normalized):
-        padded = " " + message.lower() + " "
-        if any((" " + w + " ") in padded for w in _RU_FUNCTION_WORDS):
-            return message  # revert: normalization corrupted a Russian message
-    return normalized
+        return normalized
+    return message
 
 
 def _detect_language(message: str, history: list[dict] | None = None) -> str:
@@ -245,10 +248,10 @@ async def chat(request: ChatRequest):
             nav_context if nav_context else "Контекст недоступен.",
             language=lang,
             history=_build_history_text(history),
-            intent=None,
-            entity=None,
+            intent=state.intent,
+            entity=state.entity,
             current_step=None,
-            situation=None,
+            situation=state.situation,
         )
         sessions.update_history_only(request.session_id, request.message, nav_answer)
         log_chat_request(request.session_id, request.message, "faq_interruption")
