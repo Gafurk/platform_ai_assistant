@@ -225,7 +225,10 @@ async def chat(request: ChatRequest):
     history = sessions.get_history(request.session_id)
     state = sessions.get_state(request.session_id)
     request.message = _safe_normalize_kz(request.message)
+    print(f"DEBUG SAFE_NORM: {request.message!r}")
+    print(f"DEBUG HAS_KZ: {any(ch in _KZ_CHARS for ch in request.message)}")
     lang = _detect_language(request.message, history)
+    print(f"DEBUG LANG: {lang}")
 
     # --- Intent classification ---
     new_intent = classify_intent(request.message, request.page, state.intent)
