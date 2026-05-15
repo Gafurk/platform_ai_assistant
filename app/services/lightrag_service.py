@@ -66,6 +66,97 @@ rag = LightRAG(
 )
 
 
+# ---------------------------------------------------------------------------
+# Context post-filtering
+# ---------------------------------------------------------------------------
+
+# Keywords that identify chunks as belonging to a specific service intent.
+# Both RU and KZ forms are included because the KG stores bilingual content.
+_INTENT_FILTER_KEYWORDS: dict[str, list[str]] = {
+    "tu_application": [
+        # Russian
+        "технические условия", "техусловия", "заявление на технические",
+        "шаг 1", "шаг 2", "шаг 3", "шаг 4", "шаг 5",
+        "фио", "иин", "бин", "физическое лицо", "юридическое лицо",
+        "электроснабжение", "электрических сетей",
+        # Kazakh
+        "техникалық шарттар", "жеке тұлға", "заңды тұлға",
+        "1-қадам", "2-қадам", "3-қадам", "4-қадам", "5-қадам",
+        "электрмен жабдықтау",
+    ],
+    "real_estate": [
+        # Russian
+        "объект недвижимости", "кадастровый номер",
+        "адресный регистр", "добавление объекта", "через кадастр",
+        # Kazakh
+        "жылжымайтын мүлік", "кадастрлық нөмір",
+        "адрестік регистр", "объект қосу",
+    ],
+    "supply_contract": [
+        # Russian
+        "договор электроснабжения", "договор бытов", "договор небытов",
+        "акцепт договора", "заключение договора",
+        # Kazakh
+        "электрмен жабдықтау шарты", "тұрмыстық шарт", "шарт жасасу",
+    ],
+    "load_calculation": [
+        # Russian
+        "расчет нагрузки", "расчёт нагрузки", "электрическая нагрузка",
+        "расчет электрической",
+        # Kazakh
+        "жүктеме есебі", "жүктемені есептеу", "электр жүктемесі",
+    ],
+    "draft_design": [
+        # Russian
+        "эскизный проект", "разработка эскизного", "проект внешнего",
+        # Kazakh
+        "эскиздік жоба", "жоба әзірлеу",
+    ],
+    "construction_works": [
+        # Russian
+        "строительно-монтажные", "строительно монтажные", " смр ",
+        "монтажные работы", "строительные работы",
+        # Kazakh
+        "құрылыс-монтаж", "монтаждау жұмыстары",
+    ],
+    "meter_sealing": [
+        # Russian
+        "пломб", "установка пломбы", "снятие пломбы", "прибор учета",
+        # Kazakh
+        "пломбаны орнату", "пломбаны алу", "есептеуіш аспап",
+    ],
+    "primary_connection": [
+        # Russian
+        "первичное подключение", "первичное тех", "подключение к сетям",
+        # Kazakh
+        "бастапқы қосылу", "алғашқы қосылу",
+    ],
+}
+
+
+def _filter_context_by_intent(context: str, intent: str | None) -> str:
+    """Remove chunks from unrelated services to avoid mixed templates.
+
+    Splits the LightRAG context on double-newline paragraph breaks and keeps
+    only chunks that contain intent-specific keywords or the [INTENT:] tag.
+    Falls back to the full context if filtering removes everything.
+    """
+    if not intent or not context:
+        return context
+    keywords = _INTENT_FILTER_KEYWORDS.get(intent, [])
+    if not keywords:
+        return context
+
+    chunks = context.split("\n\n")
+    relevant = [
+        chunk for chunk in chunks
+        if any(kw in chunk.lower() for kw in keywords)
+        or f"[INTENT: {intent}]" in chunk
+    ]
+    # If filtering removed everything, return original — mixed is better than empty
+    return "\n\n".join(relevant) if relevant else context
+
+
 async def initialize():
     """Initialize LightRAG storage. Must be called in FastAPI lifespan."""
     try:
@@ -132,9 +223,16 @@ async def search_docs(
         # LightRAG returns a string with context
         context = result if isinstance(result, str) else str(result)
 
+        # Filter out chunks from unrelated services to avoid mixed templates
+        if intent:
+            context = _filter_context_by_intent(context, intent)
+
         log_rag_search(query, intent or "none", language or "auto", len(context.split("\n")))
 
         print(f"DEBUG — LightRAG context_len={len(context)}, preview={context[:300] if context else 'EMPTY'}")
+
+        if intent and len(context) < 100:
+            print(f"⚠️  LightRAG returned very little context for intent={intent}. Consider lowering filter strictness.")
 
         return context if context else ""
 
