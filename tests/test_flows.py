@@ -243,6 +243,75 @@ class TestHasFlowKeywords:
         assert not has_flow_keywords("физическое лицо")
 
 
+class TestHasFlowKeywordsCurrentIntent:
+    """Phase 4: FAQ gate checks current intent only, not all intents."""
+
+    def test_foreign_keyword_does_not_block_faq_gate(self):
+        # "пломба" is a meter_sealing keyword — must NOT block FAQ gate in tu_application flow
+        assert not has_flow_keywords("нужно снять пломбу", intent="tu_application")
+
+    def test_current_intent_keyword_blocks_faq_gate(self):
+        # tu_application keyword inside tu_application flow — must block FAQ gate
+        assert has_flow_keywords("хочу уточнить технические условия", intent="tu_application")
+
+    def test_re_keyword_in_re_flow(self):
+        assert has_flow_keywords("добавить объект недвижимости", intent="real_estate")
+
+    def test_re_keyword_does_not_block_tu_flow(self):
+        # "кадастровый номер" is real_estate keyword — must not block FAQ gate in tu_application
+        assert not has_flow_keywords("кадастровый номер", intent="tu_application")
+
+    def test_no_intent_falls_back_to_all_intents(self):
+        # Without intent param: backward-compatible, checks all
+        assert has_flow_keywords("пломба")
+        assert has_flow_keywords("кадастровый номер")
+
+    def test_unknown_intent_returns_false(self):
+        assert not has_flow_keywords("технические условия", intent="unknown_service")
+
+
+class TestClassifyIntentKazakh:
+    """Verify KZ inflected forms (post normalize_kz) are recognized."""
+
+    def test_load_calc_kz_possessive_accusative(self):
+        # "жуктемесін" → "жүктемесін" after normalize_kz
+        assert classify_intent("жүктемесін есептеу", None, None) == "load_calculation"
+
+    def test_load_calc_kz_reversed_word_order(self):
+        assert classify_intent("есептеу жүктемесін", None, None) == "load_calculation"
+
+    def test_load_calc_kz_accusative(self):
+        assert classify_intent("жүктемені анықтау керек", None, None) == "load_calculation"
+
+    def test_load_calc_kz_elektr_prefix(self):
+        assert classify_intent("электр жүктемесін", None, None) == "load_calculation"
+
+    def test_draft_design_kz_accusative(self):
+        assert classify_intent("эскиздік жобаны қалай жасауға болады", None, None) == "draft_design"
+
+    def test_construction_works_kz_partial(self):
+        # "жумыстары" → "жұмыстары" after normalize_kz
+        assert classify_intent("монтаж жұмыстары туралы", None, None) == "construction_works"
+
+    def test_construction_works_kz_kurylys(self):
+        assert classify_intent("құрылыс жұмыстары қашан басталады", None, None) == "construction_works"
+
+    def test_supply_contract_kz_accusative(self):
+        assert classify_intent("тұрмыстық шартты қалай жасасуға болады", None, None) == "supply_contract_residential"
+
+    def test_supply_contract_non_residential_kz(self):
+        assert classify_intent("тұрмыстық емес шарт жасасу керек", None, None) == "supply_contract_non_residential"
+
+    def test_supply_contract_non_residential_ru(self):
+        assert classify_intent("как заключить небытовой договор", None, None) == "supply_contract_non_residential"
+
+    def test_supply_contract_residential_ru(self):
+        assert classify_intent("как заключить бытовой договор", None, None) == "supply_contract_residential"
+
+    def test_meter_sealing_kz_meter_accusative(self):
+        assert classify_intent("есептеуіш аспапты орнату", None, None) == "meter_sealing"
+
+
 class TestGetFlow:
     def test_tu_returns_linear(self):
         assert isinstance(get_flow("tu_application"), LinearFlow)

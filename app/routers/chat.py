@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter
@@ -46,7 +47,7 @@ _NAVIGATION_TRIGGERS = frozenset({
 # on queries like "где ввести ИИН" or "где указать адрес".
 _NAVIGATION_FILL_EXCLUSIONS = frozenset({
     "заполнить", "шаг", "подать", "создать",
-    "ввести", "указать",
+    "ввести", "указать", "нужн",
 })
 
 _FL_PHRASES = [
@@ -193,6 +194,29 @@ def _is_navigation_query(message: str) -> bool:
     return not any(e in lower for e in _NAVIGATION_FILL_EXCLUSIONS)
 
 
+def _extract_step_number(message: str) -> Optional[int]:
+    """Return the step number mentioned in the message, or None.
+
+    Handles Russian ("шаг 2", "2 шаг", "1-шаг", "шагу 3"), Kazakh ("қадам 1",
+    "1 қадам", "1-қадам", "қадамда 2"), and English ("step 1") forms.
+    The message must already be normalize_kz-processed so кадам → қадам.
+    """
+    lower = message.lower()
+    for pat in (
+        r"шаг\w*\s+(\d+)",          # "шаг 1", "шага 2", "шагу 3"
+        r"(\d+)\s*[-–]?\s*шаг",     # "1 шаг", "1-шаг", "2 шага"
+        r"қадам\w*\s+(\d+)",        # "қадам 1", "қадамда 2"
+        r"(\d+)\s*[-–]?\s*қадам",   # "1 қадам", "1-қадам"
+        r"\bstep\s+(\d+)",          # "step 1"
+    ):
+        m = re.search(pat, lower)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 10:
+                return n
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
@@ -242,7 +266,13 @@ async def chat(request: ChatRequest):
     # queries like "скачать ту" that the FAQ-interruption gate below would miss).
     # update_history_only preserves state so the user can resume form-filling afterwards.
     if _is_navigation_query(request.message):
-        nav_context = await search_docs(request.message, intent=None, entity=None, language=lang)
+        nav_context = await search_docs(
+            request.message,
+            intent=None,
+            entity=None,
+            language=lang,
+            current_step=_extract_step_number(request.message),
+        )
         nav_answer = await ask_llm(
             request.message,
             nav_context if nav_context else "Контекст недоступен.",
@@ -259,12 +289,18 @@ async def chat(request: ChatRequest):
 
     # --- FAQ interruption: locked flow + no flow keywords + not a step phrase ---
     # Answer the FAQ question without disturbing the active flow state.
+    # Explicit keyword switches (new_intent != state.intent) bypass this gate so the
+    # user can switch services without losing context ("Как добавить объект?", etc.).
+    # Step-number questions ("что делать на 1 шагу?") also bypass — they belong to the flow.
     active_flow = get_flow(state.intent)
+    is_explicit_switch = new_intent is not None and new_intent != state.intent
     is_faq_interruption = (
         state.locked
         and state.intent is not None
+        and not is_explicit_switch
         and not active_flow.is_step_progression(request.message)
-        and not has_flow_keywords(request.message)
+        and not has_flow_keywords(request.message, intent=state.intent)
+        and _extract_step_number(request.message) is None
     )
     if is_faq_interruption:
         faq_ctx = FlowContext(
@@ -275,7 +311,13 @@ async def chat(request: ChatRequest):
             state=state,
         )
         query = FAQFlow().build_query(faq_ctx)
-        context = await search_docs(query, intent=None, entity=None, language=lang)
+        context = await search_docs(
+            query,
+            intent=None,
+            entity=None,
+            language=lang,
+            current_step=_extract_step_number(request.message),
+        )
         answer = await ask_llm(
             request.message,
             context if context else "Контекст недоступен.",
@@ -330,6 +372,10 @@ async def chat(request: ChatRequest):
         state = state.model_copy(update={"locked": True})
 
     # --- RAG retrieval ---
+    # For flows that don't track steps (FAQFlow, supply_contract, etc.), fall back
+    # to extracting a step number directly from the message text so LightRAG can
+    # narrow the search to the correct step chunk.
+    effective_step = state.step or _extract_step_number(request.message)
     ctx = ctx.__class__(
         message=request.message,
         language=lang,
@@ -343,7 +389,7 @@ async def chat(request: ChatRequest):
         intent=state.intent,
         entity=state.entity,
         language=lang,
-        current_step=state.step,
+        current_step=effective_step,
     )
 
     # --- LLM generation ---
@@ -355,7 +401,7 @@ async def chat(request: ChatRequest):
         history=_build_history_text(history),
         intent=state.intent,
         entity=state.entity,
-        current_step=state.step,
+        current_step=effective_step,
         situation=state.situation,
     )
 

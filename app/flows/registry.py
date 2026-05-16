@@ -6,69 +6,40 @@ from app.flows.base import BaseFlow
 from app.flows.faq import FAQFlow
 from app.flows.linear import LinearFlow
 from app.flows.scenario import ScenarioFlow
+from app.config.service_registry import ServiceRegistry
 
-_FLOWS: dict[Optional[str], BaseFlow] = {
-    "tu_application": LinearFlow(),
-    "real_estate": ScenarioFlow(),
-    # New service intents — FAQ-based until dedicated flows are implemented
-    "supply_contract": FAQFlow(),
-    "load_calculation": FAQFlow(),
-    "draft_design": FAQFlow(),
-    "construction_works": FAQFlow(),
-    "meter_sealing": FAQFlow(),
-    None: FAQFlow(),
-}
+_registry = ServiceRegistry()
 
-# Keywords that indicate a specific intent — used for both detection and
-# FAQ-interruption detection (message has NONE of these → treat as FAQ).
-INTENT_KEYWORDS: dict[str, list[str]] = {
-    "tu_application": [
-        # Only TU-specific terms — no generic "submit application" phrases.
-        # Generic phrases like "өтініш беру" / "подать заявление" caused false positives
-        # (e.g. "пломбаны алуға өтініш беру" was misclassified as tu_application).
-        " ту ", "технические условия", "техусловия",
-        "заявление на ту", "заявку на ту", "заявка на ту",
-        # Kazakh
-        " тқ ", "техникалық шарттар",
-    ],
-    "real_estate": [
-        "объект недвижимости", "добавить объект",
-        "добавление объекта",
-        "кадастровый номер", "через кадастр", "по кадастру",
-        "адресный регистр", "адрестік регистр",
-        "кадастр арқылы",
-        "жылжымайтын мүлік", "жылжымайтын мүлікті",
-        "мүлік қосу", "объект қосу", "профильге қосу",
-    ],
-    "supply_contract": [
-        "договор бытовой", "бытовой договор", "договор электроснабжения",
-        "договор небытовой", "небытовой договор", "заключить договор",
-        "бытового договора", "небытового договора",
-        # Kazakh
-        "тұрмыстық шарт", "тұрмыстық емес шарт", "электрмен жабдықтау шарты",
-    ],
-    "load_calculation": [
-        "расчет нагрузки", "расчёт нагрузки", "расчет электрической",
-        "электрическая нагрузка",
-        # Kazakh
-        "жүктеме есебі", "жүктемені есептеу", "электр жүктемесін есептеу",
-    ],
-    "draft_design": [
-        "эскизный проект", "разработка эскизного", "проект внешнего",
-        # Kazakh — "жоба әзірлеу" alone is too generic ("develop a project")
-        "эскиздік жоба", "эскиздік жобаны әзірлеу",
-    ],
-    "construction_works": [
-        "строительно-монтажные", "строительно монтажные", " смр ",
-        # Kazakh
-        "құрылыс-монтаж", "құрылыс монтаждау жұмыстары",
-    ],
-    "meter_sealing": [
-        "пломб", "установка пломбы", "снятие пломбы", "прибор учета",
-        # Kazakh
-        "пломбаны орнату", "пломбаны алу", "есептеуіш аспап",
-    ],
-}
+# ---------------------------------------------------------------------------
+# Flow map — built from config so new services need no code changes here.
+# ---------------------------------------------------------------------------
+
+def _build_flows() -> dict[Optional[str], BaseFlow]:
+    _flow_classes: dict[str, BaseFlow] = {
+        "linear": LinearFlow(),
+        "scenario": ScenarioFlow(),
+        "faq": FAQFlow(),
+    }
+    flows: dict[Optional[str], BaseFlow] = {}
+    for service_id, svc in _registry.list_services().items():
+        flows[service_id] = _flow_classes.get(svc.flow.type, FAQFlow())
+    flows[None] = FAQFlow()
+    return flows
+
+
+_FLOWS: dict[Optional[str], BaseFlow] = _build_flows()
+
+# ---------------------------------------------------------------------------
+# Intent keywords — loaded from config/keywords.yaml.
+# Kept as a module-level dict so external code that imports INTENT_KEYWORDS
+# directly continues to work without changes (backward compatible).
+# ---------------------------------------------------------------------------
+
+INTENT_KEYWORDS: dict[str, list[str]] = _registry.build_intent_keywords_map()
+
+# ---------------------------------------------------------------------------
+# Page-based intent detection map
+# ---------------------------------------------------------------------------
 
 _PAGE_INTENT_MAP: dict[str, list[str]] = {
     "tu_application": [
@@ -81,6 +52,10 @@ _PAGE_INTENT_MAP: dict[str, list[str]] = {
     ],
 }
 
+
+# ---------------------------------------------------------------------------
+# Public API — unchanged signatures for full backward compatibility
+# ---------------------------------------------------------------------------
 
 def get_flow(intent: Optional[str]) -> BaseFlow:
     return _FLOWS.get(intent, _FLOWS[None])
@@ -120,9 +95,17 @@ def classify_intent(
     return None
 
 
-def has_flow_keywords(message: str) -> bool:
-    """True if the message contains keywords specific to any tracked intent."""
+def has_flow_keywords(message: str, intent: Optional[str] = None) -> bool:
+    """True if the message contains flow keywords.
+
+    When intent is given, checks only that intent's keywords (precise FAQ gate:
+    only a keyword from the *current* intent blocks FAQ interruption).
+    Without intent, checks all intents (backward-compatible).
+    """
     lower = " " + message.lower() + " "
+    if intent is not None:
+        keywords = INTENT_KEYWORDS.get(intent, [])
+        return any(kw in lower for kw in keywords)
     return any(
         any(kw in lower for kw in keywords)
         for keywords in INTENT_KEYWORDS.values()
