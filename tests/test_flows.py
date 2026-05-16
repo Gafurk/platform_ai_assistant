@@ -243,6 +243,33 @@ class TestHasFlowKeywords:
         assert not has_flow_keywords("физическое лицо")
 
 
+class TestHasFlowKeywordsCurrentIntent:
+    """Phase 4: FAQ gate checks current intent only, not all intents."""
+
+    def test_foreign_keyword_does_not_block_faq_gate(self):
+        # "пломба" is a meter_sealing keyword — must NOT block FAQ gate in tu_application flow
+        assert not has_flow_keywords("нужно снять пломбу", intent="tu_application")
+
+    def test_current_intent_keyword_blocks_faq_gate(self):
+        # tu_application keyword inside tu_application flow — must block FAQ gate
+        assert has_flow_keywords("хочу уточнить технические условия", intent="tu_application")
+
+    def test_re_keyword_in_re_flow(self):
+        assert has_flow_keywords("добавить объект недвижимости", intent="real_estate")
+
+    def test_re_keyword_does_not_block_tu_flow(self):
+        # "кадастровый номер" is real_estate keyword — must not block FAQ gate in tu_application
+        assert not has_flow_keywords("кадастровый номер", intent="tu_application")
+
+    def test_no_intent_falls_back_to_all_intents(self):
+        # Without intent param: backward-compatible, checks all
+        assert has_flow_keywords("пломба")
+        assert has_flow_keywords("кадастровый номер")
+
+    def test_unknown_intent_returns_false(self):
+        assert not has_flow_keywords("технические условия", intent="unknown_service")
+
+
 class TestClassifyIntentKazakh:
     """Verify KZ inflected forms (post normalize_kz) are recognized."""
 
