@@ -6,6 +6,7 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 from dotenv import load_dotenv
 from app.services import lightrag_service
+from app.config.service_registry import ServiceRegistry
 
 load_dotenv()
 
@@ -55,22 +56,17 @@ def _extract_page_context(text: str) -> str | None:
 
 
 def _slug_intent(intent_name: str | None, filename: str) -> tuple[str, str]:
-    # Space-padded so " ту " and " тқ " don't match inside longer words
-    combined = " " + ((intent_name or "") + " " + filename).lower() + " "
-    if "недвижим" in combined:
-        return "real_estate", "Добавление объекта недвижимости"
-    if any(kw in combined for kw in ["расчет нагрузки", "расчёт нагрузки", "жүктеме есебі"]):
-        return "load_calculation", "Расчёт электрической нагрузки"
-    if any(kw in combined for kw in ["эскизный", "эскиздік жоба"]):
-        return "draft_design", "Разработка эскизного проекта"
-    if any(kw in combined for kw in ["строительно-монтажн", "құрылыс-монтаж"]):
-        return "construction_works", "Строительно-монтажные работы"
-    if any(kw in combined for kw in ["технические", "техусловия", "туслов", " ту ", " тқ "]):
-        return "tu_application", "Заявление на технические условия"
-    if any(kw in combined for kw in ["договор бытов", "договор небытов"]):
-        return "supply_contract", "Договор электроснабжения"
-    if "пломб" in combined:
-        return "meter_sealing", "Установка/снятие пломбы"
+    """Detect service intent from document metadata and filename.
+
+    Delegates to ServiceRegistry so adding new services requires only a
+    YAML edit — no changes here.
+    """
+    registry = ServiceRegistry()
+    text = intent_name or ""
+    service_id = registry.detect_intent(text, filename)
+    if service_id:
+        display = registry.get_display_name(service_id, "ru")
+        return service_id, display
     return "general", re.sub(r'\.[^.]+$', '', filename)
 
 

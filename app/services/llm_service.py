@@ -16,7 +16,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
 _INTENT_LABELS = {
     "real_estate": "Добавление объекта недвижимости",
     "tu_application": "Заявление на технические условия",
-    "supply_contract": "Договор электроснабжения",
+    "supply_contract_residential": "Договор электроснабжения (бытовой)",
+    "supply_contract_non_residential": "Договор электроснабжения (небытовой)",
     "load_calculation": "Расчёт электрической нагрузки",
     "draft_design": "Разработка эскизного проекта",
     "construction_works": "Строительно-монтажные работы",
