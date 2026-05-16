@@ -47,7 +47,7 @@ _NAVIGATION_TRIGGERS = frozenset({
 # on queries like "где ввести ИИН" or "где указать адрес".
 _NAVIGATION_FILL_EXCLUSIONS = frozenset({
     "заполнить", "шаг", "подать", "создать",
-    "ввести", "указать",
+    "ввести", "указать", "нужн",
 })
 
 _FL_PHRASES = [
@@ -289,12 +289,18 @@ async def chat(request: ChatRequest):
 
     # --- FAQ interruption: locked flow + no flow keywords + not a step phrase ---
     # Answer the FAQ question without disturbing the active flow state.
+    # Explicit keyword switches (new_intent != state.intent) bypass this gate so the
+    # user can switch services without losing context ("Как добавить объект?", etc.).
+    # Step-number questions ("что делать на 1 шагу?") also bypass — they belong to the flow.
     active_flow = get_flow(state.intent)
+    is_explicit_switch = new_intent is not None and new_intent != state.intent
     is_faq_interruption = (
         state.locked
         and state.intent is not None
+        and not is_explicit_switch
         and not active_flow.is_step_progression(request.message)
-        and not has_flow_keywords(request.message)
+        and not has_flow_keywords(request.message, intent=state.intent)
+        and _extract_step_number(request.message) is None
     )
     if is_faq_interruption:
         faq_ctx = FlowContext(

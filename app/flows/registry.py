@@ -95,9 +95,17 @@ def classify_intent(
     return None
 
 
-def has_flow_keywords(message: str) -> bool:
-    """True if the message contains keywords specific to any tracked intent."""
+def has_flow_keywords(message: str, intent: Optional[str] = None) -> bool:
+    """True if the message contains flow keywords.
+
+    When intent is given, checks only that intent's keywords (precise FAQ gate:
+    only a keyword from the *current* intent blocks FAQ interruption).
+    Without intent, checks all intents (backward-compatible).
+    """
     lower = " " + message.lower() + " "
+    if intent is not None:
+        keywords = INTENT_KEYWORDS.get(intent, [])
+        return any(kw in lower for kw in keywords)
     return any(
         any(kw in lower for kw in keywords)
         for keywords in INTENT_KEYWORDS.values()
