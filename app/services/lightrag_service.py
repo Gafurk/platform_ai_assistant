@@ -67,107 +67,25 @@ rag = LightRAG(
 
 
 # ---------------------------------------------------------------------------
-# Context post-filtering
+# Context post-filtering — metadata tag based (Phase 3)
 # ---------------------------------------------------------------------------
 
-# Keywords that identify chunks as belonging to a specific service intent.
-# Both RU and KZ forms are included because the KG stores bilingual content.
-_INTENT_FILTER_KEYWORDS: dict[str, list[str]] = {
-    "tu_application": [
-        # Russian
-        "технические условия", "техусловия", "заявление на технические",
-        "шаг 1", "шаг 2", "шаг 3", "шаг 4", "шаг 5",
-        "фио", "иин", "бин", "физическое лицо", "юридическое лицо",
-        "электроснабжение", "электрических сетей",
-        # Kazakh
-        "техникалық шарттар", "жеке тұлға", "заңды тұлға",
-        "1-қадам", "2-қадам", "3-қадам", "4-қадам", "5-қадам",
-        "электрмен жабдықтау",
-    ],
-    "real_estate": [
-        # Russian
-        "объект недвижимости", "кадастровый номер",
-        "адресный регистр", "добавление объекта", "через кадастр",
-        # Kazakh
-        "жылжымайтын мүлік", "кадастрлық нөмір",
-        "адрестік регистр", "объект қосу",
-    ],
-    "supply_contract_non_residential": [
-        # Russian
-        "договор небытов", "акцепт договора", "заключение договора",
-        "встроенное помещение", "пристроенное помещение",
-        # Kazakh
-        "тұрмыстық емес шарт", "электрмен жабдықтау шарты",
-    ],
-    "supply_contract_residential": [
-        # Russian
-        "договор бытов", "договор электроснабжения",
-        "акцепт договора", "заключение договора",
-        "кондоминиум", "количество проживающих",
-        # Kazakh
-        "тұрмыстық шарт", "электрмен жабдықтау шарты",
-    ],
-    "load_calculation": [
-        # Russian
-        "расчет нагрузки", "расчёт нагрузки", "электрическая нагрузка",
-        "расчет электрической",
-        # Russian — unique field names absent from other services
-        "вид объекта недвижимости", "количество квартир",
-        "уровень электрификации", "электроприемник", "целевое назначение",
-        # Kazakh
-        "жүктеме есебі", "жүктемені есептеу", "электр жүктемесі",
-        "жүктемесін", "жүктемені", "жүктемесі",
-    ],
-    "draft_design": [
-        # Russian
-        "эскизный проект", "разработка эскизного", "проект внешнего",
-        # Russian — unique field names absent from other services
-        "тип подключения", "расстояние до точки", "топографическая съемка",
-        "проект внешнего электроснабжения",
-        # Kazakh
-        "эскиздік жоба", "эскиздік жобаны әзірлеу",
-    ],
-    "construction_works": [
-        # Russian
-        "строительно-монтажные", "строительно монтажные", " смр ",
-        "монтажные работы", "строительные работы",
-        # Russian — unique field names absent from other services
-        "очередь строительства", "год реализации", "этап строительства",
-        # Kazakh
-        "құрылыс-монтаж", "монтаждау жұмыстары", "құрылыс монтаждау жұмыстары",
-    ],
-    "meter_sealing": [
-        # Russian
-        "пломб", "установка пломбы", "снятие пломбы", "прибор учета",
-        # Russian — unique field names absent from other services
-        "заводской номер", "лицевой счет", "абонентский номер",
-        "причина установки", "причина снятия",
-        # Kazakh
-        "пломбаны орнату", "пломбаны алу", "есептеуіш аспап",
-    ],
-}
-
-
 def _filter_context_by_intent(context: str, intent: str | None) -> str:
-    """Remove chunks from unrelated services to avoid mixed templates.
+    """Keep only chunks whose [INTENT:] metadata tag matches the current intent.
 
-    Splits the LightRAG context on double-newline paragraph breaks and keeps
-    only chunks that contain intent-specific keywords or the [INTENT:] tag.
-    Falls back to the full context if filtering removes everything.
+    Each ingested chunk starts with:
+        [FILENAME: ...] [INTENT: {slug}] [LANGUAGE: ...] [TITLE: ...]
+
+    Filtering on this tag avoids keyword conflicts between services entirely.
+    Falls back to the full context if no tagged chunks match — mixed is better
+    than empty (e.g. when querying an empty graph during development).
     """
     if not intent or not context:
         return context
-    keywords = _INTENT_FILTER_KEYWORDS.get(intent, [])
-    if not keywords:
-        return context
 
-    chunks = context.split("\n\n")
-    relevant = [
-        chunk for chunk in chunks
-        if any(kw in chunk.lower() for kw in keywords)
-        or f"[INTENT: {intent}]" in chunk
-    ]
-    # If filtering removed everything, return original — mixed is better than empty
+    tag = f"[INTENT: {intent}]"
+    chunks = [c for c in context.split("\n\n") if c.strip()]
+    relevant = [c for c in chunks if tag in c]
     return "\n\n".join(relevant) if relevant else context
 
 
@@ -209,9 +127,13 @@ async def search_docs(
         # Prepend step, intent, and entity to query for graph extraction
         enriched_query = query
         if current_step is not None:
-            enriched_query = f"[Шаг {current_step}] {enriched_query}"
+            # "[TITLE: Шаг N]" matches the exact metadata prefix in ingested chunks,
+            # improving vector similarity for the right step.
+            enriched_query = f"[TITLE: Шаг {current_step}] {enriched_query}"
         if intent:
-            enriched_query = f"[{intent}] {enriched_query}"
+            # "[INTENT: ...]" matches the exact metadata prefix in ingested chunks,
+            # so the vector search prefers chunks from the correct service.
+            enriched_query = f"[INTENT: {intent}] {enriched_query}"
         if entity:
             enriched_query = f"[{entity}] {enriched_query}"
             # Append entity-specific terms to help LightRAG disambiguate

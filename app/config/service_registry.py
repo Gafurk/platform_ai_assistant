@@ -138,7 +138,7 @@ class ServiceRegistry:
         return list(kw.get("ru") or []) + list(kw.get("kz") or [])
 
     def get_filter_keywords(self, service_id: str) -> list[str]:
-        """Keywords used for context post-filtering in lightrag_service (Phase 1-2)."""
+        """Filter keywords from keywords.yaml (retained for reference/tooling)."""
         kw = self._filter_keywords.get(service_id) or {}
         return list(kw.get("ru") or []) + list(kw.get("kz") or [])
 
@@ -181,14 +181,6 @@ class ServiceRegistry:
         instead of maintaining a separate hardcoded dict.
         """
         return {sid: self.get_all_flow_keywords(sid) for sid in self._services}
-
-    def build_filter_keywords_map(self) -> dict[str, list[str]]:
-        """Return {service_id: [all filter keywords]} for all services.
-
-        Used by lightrag_service.py to rebuild _INTENT_FILTER_KEYWORDS
-        from config instead of maintaining a separate hardcoded dict.
-        """
-        return {sid: self.get_filter_keywords(sid) for sid in self._services}
 
     # ------------------------------------------------------------------
     # Page-intent map (static, can be extended to YAML later)
