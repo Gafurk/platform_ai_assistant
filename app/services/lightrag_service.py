@@ -70,23 +70,71 @@ rag = LightRAG(
 # Context post-filtering — metadata tag based (Phase 3)
 # ---------------------------------------------------------------------------
 
-def _filter_context_by_intent(context: str, intent: str | None) -> str:
+def _filter_context_by_intent(
+    context: str, intent: str | None, current_step: int | None = None
+) -> str:
     """Keep only chunks whose [INTENT:] metadata tag matches the current intent.
 
     Each ingested chunk starts with:
         [FILENAME: ...] [INTENT: {slug}] [LANGUAGE: ...] [TITLE: ...]
 
-    Filtering on this tag avoids keyword conflicts between services entirely.
-    Falls back to the full context if no tagged chunks match — mixed is better
-    than empty (e.g. when querying an empty graph during development).
+    LightRAG returns chunks as JSON objects separated by newlines. We split on
+    the JSON object boundary so each element is a complete chunk (metadata + body),
+    not a paragraph fragment.
+
+    When current_step is provided, after intent-filtering we further prefer chunks
+    whose text contains "Шаг N" — this prevents terminology/FAQ blocks that share
+    the same intent tag from being returned for the wrong step.
+
+    When LightRAG returns entity-only context (0 vector chunks, no reference_id
+    objects), there are no [INTENT:] tags to match. In that case we pass the full
+    context through so the LLM can use entity descriptions instead of getting an
+    empty context and falling back to navigation hints.
     """
+    import re as _re
+
     if not intent or not context:
         return context
 
     tag = f"[INTENT: {intent}]"
-    chunks = [c for c in context.split("\n\n") if c.strip()]
-    relevant = [c for c in chunks if tag in c]
-    return "\n\n".join(relevant) if relevant else context
+
+    # Split on JSON chunk boundaries: each chunk is a {"reference_id":...} object.
+    # Keep the header portion (entity section, markdown fences) intact.
+    parts = _re.split(r'(?=\{"reference_id")', context)
+    header = ""
+    chunks: list[str] = []
+    for part in parts:
+        if part.lstrip().startswith('{"reference_id"'):
+            chunks.append(part)
+        else:
+            header += part
+
+    if chunks:
+        relevant = [c for c in chunks if tag in c]
+        # When step is known, prefer chunks that contain "Шаг N" — this filters out
+        # same-intent terminology or FAQ blocks that share the intent tag but belong
+        # to a different section (e.g. "Ситуация 4" terminology vs "Шаг 4" form).
+        if relevant and current_step is not None:
+            step_tag = f"Шаг {current_step}"
+            step_relevant = [c for c in relevant if step_tag in c]
+            if step_relevant:
+                relevant = step_relevant
+        if relevant:
+            return header + "".join(relevant)
+        # Chunks found but none match intent — safer than returning unrelated service content.
+        return ""
+
+    # Fallback: non-JSON context (legacy test format or entity-only LightRAG output).
+    paragraphs = [c for c in context.split("\n\n") if c.strip()]
+    relevant = [c for c in paragraphs if tag in c]
+    if relevant:
+        return "\n\n".join(relevant)
+    # If no paragraph carries any [INTENT:] tag at all, this is entity-only context
+    # (LightRAG returned 0 vector chunks). Pass it through so the LLM can use entity
+    # descriptions rather than receiving an empty context.
+    if not any("[INTENT:" in c for c in paragraphs):
+        return context
+    return ""
 
 
 async def initialize():
@@ -101,7 +149,7 @@ async def initialize():
 
 async def search_docs(
     query: str,
-    top_k: int = 7,
+    top_k: int = 20,
     intent: str = None,
     entity: str = None,
     page: str = None,
@@ -136,17 +184,14 @@ async def search_docs(
             enriched_query = f"[INTENT: {intent}] {enriched_query}"
         if entity:
             enriched_query = f"[{entity}] {enriched_query}"
-            # Append entity-specific terms to help LightRAG disambiguate
-            # ФЛ vs ЮЛ chunks when both exist for the same step.
-            if "юридическое" in entity:
-                enriched_query += " БИН организация руководитель"
-            elif "физическое" in entity:
-                enriched_query += " ФИО ИИН"
+            # NOTE: Do NOT append "ФИО ИИН" / "БИН организация руководитель" here.
+            # Those suffixes bias the entity graph toward Step-1 entity chunks for
+            # every step query (ФИО/ИИН appear in many documents and dominate graph
+            # traversal, causing Steps 2-5 to return Step-1 content).
 
         print(f"DEBUG — LightRAG query: step={current_step}, intent={intent}, entity={entity}, lang={language}, q_len={len(query)}")
 
-        # Query knowledge graph with only_need_context=True
-        # This returns raw context without LLM generation
+        # Primary search: hybrid mode (graph traversal + vector similarity).
         result = await rag.aquery(
             enriched_query,
             param=QueryParam(
@@ -156,19 +201,47 @@ async def search_docs(
             ),
         )
 
-        # LightRAG returns a string with context
-        context = result if isinstance(result, str) else str(result)
+        import re as _re_diag
+
+        raw_context = result if isinstance(result, str) else str(result)
+        raw_chunk_count = len(_re_diag.findall(r'\{"reference_id"', raw_context))
+        print(f"DEBUG — LightRAG hybrid raw_chunks={raw_chunk_count}, raw_len={len(raw_context)}")
+
+        # Naive fallback for step-specific queries when hybrid returns 0 text chunks.
+        #
+        # When hybrid returns 0 vector chunks it falls back to entity-related chunks,
+        # which are biased toward Step-1 entities (ФИО/ИИН dominate the graph).
+        # Naive mode skips graph traversal and uses direct vector similarity against
+        # the indexed text chunks, giving step-specific content a fair ranking.
+        # We use a minimal natural-language query so the embedding closely matches
+        # the document step content rather than the metadata-tag-heavy enriched query.
+        if raw_chunk_count == 0 and current_step is not None:
+            naive_query = f"шаг {current_step} {query}"
+            naive_result = await rag.aquery(
+                naive_query,
+                param=QueryParam(mode="naive", only_need_context=True, top_k=top_k),
+            )
+            naive_raw = naive_result if isinstance(naive_result, str) else str(naive_result)
+            naive_chunks = len(_re_diag.findall(r'\{"reference_id"', naive_raw))
+            print(f"DEBUG — naive fallback step={current_step}: found {naive_chunks} chunks")
+            if naive_chunks > 0:
+                raw_context = naive_raw
+                raw_chunk_count = naive_chunks
 
         # Filter out chunks from unrelated services to avoid mixed templates
+        context = raw_context
         if intent:
-            context = _filter_context_by_intent(context, intent)
+            context = _filter_context_by_intent(raw_context, intent, current_step=current_step)
 
         log_rag_search(query, intent or "none", language or "auto", len(context.split("\n")))
 
-        print(f"DEBUG — LightRAG context_len={len(context)}, preview={context[:300] if context else 'EMPTY'}")
+        filtered_chunk_count = len(_re_diag.findall(r'\{"reference_id"', context))
+        print(f"DEBUG — after_filter chunks={filtered_chunk_count}, context_len={len(context)}, preview={context[:200] if context else 'EMPTY'}")
 
-        if intent and len(context) < 100:
-            print(f"⚠️  LightRAG returned very little context for intent={intent}. Consider lowering filter strictness.")
+        if intent and raw_chunk_count > 0 and filtered_chunk_count == 0:
+            print(f"⚠️  All {raw_chunk_count} chunks filtered out for intent={intent}. Check intent tags in indexed documents.")
+        elif raw_chunk_count == 0:
+            print(f"⚠️  Both hybrid and naive returned 0 text chunks. top_k={top_k}, intent={intent}, step={current_step}")
 
         return context if context else ""
 
