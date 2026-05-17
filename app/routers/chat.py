@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from app.flows.base import FlowContext
 from app.flows.faq import FAQFlow
 from app.flows.registry import classify_intent, get_flow, has_flow_keywords
+from app.flows.scenario import ScenarioFlow
 from app.models.schemas import ChatRequest, ChatResponse, FlowState
 from app.services.llm_service import ask_llm
 from app.services.rag import search_docs
@@ -133,6 +134,25 @@ def _detect_entity(message: str, history: list[dict]) -> Optional[str]:
     if any(ph in all_text for ph in _FL_PHRASES):
         return "физическое лицо"
     if any(ph in all_text for ph in _UL_PHRASES):
+        return "юридическое лицо"
+    return None
+
+
+def _detect_entity_from_message_only(message: str) -> Optional[str]:
+    """Check ONLY the current message for entity type — no history scan.
+
+    Used to allow mid-session entity override ("я юр лицо", "как физ лицо")
+    and to prevent entity pollution when the intent just switched.
+    """
+    stripped = message.strip().lower()
+    if stripped in _FL_EXACT:
+        return "физическое лицо"
+    if stripped in _UL_EXACT:
+        return "юридическое лицо"
+    text = " " + message.lower() + " "
+    if any(ph in text for ph in _FL_PHRASES):
+        return "физическое лицо"
+    if any(ph in text for ph in _UL_PHRASES):
         return "юридическое лицо"
     return None
 
@@ -292,10 +312,13 @@ async def chat(request: ChatRequest):
     # Explicit keyword switches (new_intent != state.intent) bypass this gate so the
     # user can switch services without losing context ("Как добавить объект?", etc.).
     # Step-number questions ("что делать на 1 шагу?") also bypass — they belong to the flow.
+    # FAQ-type services (load_calculation, construction_works, etc.) never set locked —
+    # extend interruption to them so off-topic questions don't inherit wrong service context.
     active_flow = get_flow(state.intent)
     is_explicit_switch = new_intent is not None and new_intent != state.intent
+    is_faq_service = state.intent is not None and isinstance(active_flow, FAQFlow)
     is_faq_interruption = (
-        state.locked
+        (state.locked or is_faq_service)
         and state.intent is not None
         and not is_explicit_switch
         and not active_flow.is_step_progression(request.message)
@@ -318,27 +341,41 @@ async def chat(request: ChatRequest):
             language=lang,
             current_step=_extract_step_number(request.message),
         )
+        # FIX #4B: For pure FAQ questions (no active flow), don't pass history
+        # This prevents LLM from following historical patterns when session is long (20+ messages)
+        faq_history = "" if is_faq_service else _build_history_text(history)
         answer = await ask_llm(
             request.message,
             context if context else "Контекст недоступен.",
             language=lang,
-            history=_build_history_text(history),
+            history=faq_history,
         )
         sessions.update_history_only(request.session_id, request.message, answer)
         log_chat_request(request.session_id, request.message, "faq_interruption")
         return ChatResponse(answer=answer, source="llm", handoff=False)
 
     # --- Intent update (only when not locked, or explicit switch) ---
+    intent_just_switched = False
     if new_intent != state.intent:
         if not state.locked:
             # Fresh intent — reset all flow state, capture original question
             state = FlowState(intent=new_intent, original_question=request.message)
+            intent_just_switched = True
         # If locked, explicit keyword switch is still allowed
         elif new_intent is not None and new_intent != state.intent:
             state = FlowState(intent=new_intent, original_question=request.message)
+            intent_just_switched = True
 
     # --- Entity detection ---
-    if state.entity is None:
+    # Priority 1: explicit entity in current message — always overrides existing value.
+    # Handles "я юр лицо" and "хочу как физ лицо" mid-session corrections.
+    msg_entity = _detect_entity_from_message_only(request.message)
+    if msg_entity and msg_entity != state.entity:
+        state = state.model_copy(update={"entity": msg_entity})
+    elif state.entity is None and not intent_just_switched:
+        # Same intent, no entity yet — scan history for continuity.
+        # When intent just switched, skip history to avoid inheriting entity
+        # from a different service's conversation.
         detected = _detect_entity(request.message, history)
         if detected:
             state = state.model_copy(update={"entity": detected})
@@ -372,10 +409,22 @@ async def chat(request: ChatRequest):
         state = state.model_copy(update={"locked": True})
 
     # --- RAG retrieval ---
-    # For flows that don't track steps (FAQFlow, supply_contract, etc.), fall back
-    # to extracting a step number directly from the message text so LightRAG can
-    # narrow the search to the correct step chunk.
-    effective_step = state.step or _extract_step_number(request.message)
+    # Priority: explicit step in message > flow state step > 1 (if intent set) > None.
+    # An explicit "шаг 2" in the message always wins over state.step so LightRAG
+    # retrieves the right chunk even when the LinearFlow counter hasn't advanced yet.
+    # Defaulting to 1 when intent is set (and the flow is not scenario-based) ensures
+    # FAQ services (construction_works, draft_design, etc.) retrieve Step-1 content
+    # on their initial query. ScenarioFlow (real_estate) is excluded because its
+    # documents are structured as situations, not numbered steps.
+    msg_step = _extract_step_number(request.message)
+    if msg_step is not None:
+        effective_step = msg_step
+    elif state.step is not None:
+        effective_step = state.step
+    elif state.intent is not None and not isinstance(flow, ScenarioFlow):
+        effective_step = 1
+    else:
+        effective_step = None
     ctx = ctx.__class__(
         message=request.message,
         language=lang,
