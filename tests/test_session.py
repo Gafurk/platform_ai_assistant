@@ -54,15 +54,15 @@ def test_update_appends_history():
     assert history[3] == {"role": "assistant", "content": "reply"}
 
 
-def test_history_capped_at_20_entries():
+def test_history_capped_at_10_entries():
     sm = make_sm()
-    for i in range(15):  # 15 turns = 30 entries → capped at 20
+    for i in range(10):  # 10 turns = 20 entries → capped at 10
         sm.update("s1", FlowState(), f"u{i}", f"b{i}")
     history = sm.get_history("s1")
-    assert len(history) == 20
+    assert len(history) == 10
     # Most recent entries preserved
-    assert history[-1]["content"] == "b14"
-    assert history[-2]["content"] == "u14"
+    assert history[-1]["content"] == "b9"
+    assert history[-2]["content"] == "u9"
 
 
 def test_get_history_returns_copy():

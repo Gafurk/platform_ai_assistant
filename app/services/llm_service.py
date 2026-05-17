@@ -67,7 +67,7 @@ async def _call_openai(system: str, prompt: str) -> str:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 1000,
+                    "max_tokens": 1500,
                 },
             )
             data = response.json()
