@@ -257,15 +257,18 @@ class TestFilterContextByIntent:
         assert "Очереди строительства" in result
         assert "Подписание заявления" not in result
 
-    def test_step_filter_fallback_when_no_step_match(self):
-        # If NO intent-matched chunk contains "Шаг N", keep all of them (don't over-filter).
+    def test_step_filter_returns_empty_when_no_step_match(self):
+        # When intent-matched chunks exist but NONE contain "Шаг N", return ""
+        # so search_docs can trigger the step fallback query instead of serving
+        # an off-topic chunk (e.g. "Ситуация 4" for a Шаг 5 query, or a Шаг 2
+        # chunk for a Шаг 1 РЭН query).
         chunk = self._ref_chunk(
             "tu_application",
             "Общая информация",
             "Общий текст о ТУ без указания шага",
         )
         result = _filter_context_by_intent(chunk, "tu_application", current_step=3)
-        assert "Общий текст о ТУ" in result
+        assert result == ""
 
     def test_step_filter_none_step_does_not_narrow(self):
         # Without current_step, all intent-matched chunks are returned.

@@ -3,7 +3,7 @@ from app.services import lightrag_service
 
 async def search_docs(
     query: str,
-    top_k: int = 7,
+    top_k: int = 20,
     intent: str = None,
     entity: str = None,
     page: str = None,

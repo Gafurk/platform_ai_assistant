@@ -161,6 +161,29 @@
 
     .upload-btn:disabled { background: #e2e8f0; color: #94a3b8; cursor: not-allowed; }
 
+    .reindex-btn {
+      width: 100%;
+      padding: 10px 16px;
+      background: transparent;
+      color: #1a56db;
+      border: 1.5px solid #c7d8f8;
+      border-radius: 11px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+      letter-spacing: -0.1px;
+      transition: all 0.2s ease;
+      margin-top: 8px;
+    }
+
+    .reindex-btn:hover:not(:disabled) {
+      background: #eff6ff;
+      border-color: #1a56db;
+    }
+
+    .reindex-btn:disabled { border-color: #e2e8f0; color: #94a3b8; cursor: not-allowed; }
+
     .status-msg {
       margin-top: 10px;
       padding: 10px 14px;
@@ -609,6 +632,11 @@
 
     <div id="upload-status" class="status-msg"></div>
 
+    <button class="reindex-btn" id="reindex-btn" onclick="reindex()">
+      ↺ Переиндексировать граф знаний
+    </button>
+    <div id="reindex-status" class="status-msg"></div>
+
     <div class="doc-list-section">
       <div class="doc-list-label">Загруженные документы</div>
       <div id="doc-list-container">
@@ -702,7 +730,7 @@
     btn.disabled = true;
     btn.textContent = 'Загружаю...';
     status.className = 'status-msg info';
-    status.textContent = '⏳ Загрузка и обработка документа...';
+    status.textContent = '⏳ Сохранение файла...';
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -712,11 +740,11 @@
       const data = await res.json();
       if (res.ok) {
         status.className = 'status-msg success';
-        status.textContent = '✅ Документ загружен и обрабатывается в фоне';
+        status.textContent = '✅ Файл сохранён — нажмите «Переиндексировать» для обновления графа';
         selectedFile = null;
         document.getElementById('selected-file').style.display = 'none';
         document.getElementById('file-input').value = '';
-        setTimeout(loadDocuments, 25000);
+        loadDocuments();
       } else {
         status.className = 'status-msg error';
         status.textContent = '❌ Ошибка: ' + (data.detail || 'Неизвестная ошибка');
@@ -730,6 +758,72 @@
     btn.disabled = false;
   }
 
+  async function reindex() {
+    const btn = document.getElementById('reindex-btn');
+    const status = document.getElementById('reindex-status');
+
+    btn.disabled = true;
+    btn.textContent = '↺ Индексирую...';
+    status.className = 'status-msg info';
+    status.style.display = 'block';
+    status.textContent = '⏳ Подготовка...';
+
+    try {
+      const res = await fetch(`${API}/reindex`, { method: 'POST' });
+      if (!res.ok || !res.body) {
+        status.className = 'status-msg error';
+        status.textContent = '❌ Ошибка запуска переиндексации';
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try { handleReindexEvent(JSON.parse(line.slice(6)), status); } catch {}
+        }
+      }
+    } catch (e) {
+      status.className = 'status-msg error';
+      status.textContent = '❌ Соединение прервано';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '↺ Переиндексировать граф знаний';
+    }
+  }
+
+  function handleReindexEvent(ev, status) {
+    if (ev.status === 'wiping') {
+      status.textContent = '🗑 Очистка старого графа...';
+    } else if (ev.status === 'init') {
+      status.textContent = '⚡ Инициализация LightRAG...';
+    } else if (ev.status === 'progress') {
+      const name = ev.file.length > 33 ? ev.file.substring(33) : ev.file;
+      status.textContent = `📄 (${ev.done + 1}/${ev.total}) ${name}`;
+    } else if (ev.status === 'file_error') {
+      status.className = 'status-msg error';
+      const name = ev.file.length > 33 ? ev.file.substring(33) : ev.file;
+      status.textContent = `⚠️ Ошибка: ${name} — ${ev.error}`;
+    } else if (ev.status === 'error') {
+      status.className = 'status-msg error';
+      status.textContent = `❌ ${ev.message}`;
+    } else if (ev.status === 'done') {
+      status.className = 'status-msg success';
+      status.textContent = ev.total === 0
+        ? '✅ Граф очищен — загрузите документы и переиндексируйте'
+        : `✅ Граф обновлён — ${ev.total} документов проиндексировано`;
+      loadDocuments();
+    }
+  }
+
   async function loadDocuments() {
     try {
       const res = await fetch(`${API}/documents`);
@@ -741,21 +835,24 @@
         return;
       }
 
-      container.innerHTML = data.documents.map(doc => `
+      container.innerHTML = data.documents.map(doc => {
+        const safe = doc.filename.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const display = safe.substring(0, 34) + (doc.filename.length > 34 ? '…' : '');
+        return `
         <div class="doc-item" id="doc-${CSS.escape(doc.filename)}">
           <div class="doc-name">
             <i class="fi fi-rr-document"></i>
-            <span>${doc.filename.substring(0, 34)}${doc.filename.length > 34 ? '…' : ''}</span>
+            <span>${display}</span>
           </div>
           <div class="doc-meta">
             <span class="doc-size">${doc.size_kb} KB</span>
             <span class="doc-badge">готов</span>
-            <button class="delete-btn" data-filename="${CSS.escape(doc.filename)}" onclick="deleteDocument(this.getAttribute('data-filename'))" title="Удалить">
+            <button class="delete-btn" data-filename="${safe}" onclick="deleteDocument(this.dataset.filename)" title="Удалить">
               <i class="fi fi-rr-trash"></i>
             </button>
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     } catch (e) {
       document.getElementById('doc-list-container').innerHTML =
         '<p style="font-size:13px;color:#ef4444;">Ошибка загрузки списка</p>';

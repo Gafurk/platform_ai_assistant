@@ -4,6 +4,18 @@ from openai import AsyncOpenAI
 from lightrag import LightRAG, QueryParam
 from lightrag.utils import EmbeddingFunc
 from app.utils.logger import log_rag_search, log_qdrant_error
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_LLM_MODEL = os.getenv("OPENAI_MODEL", "")
+# Use a dedicated non-reasoning model for LightRAG entity/relation extraction.
+# Reasoning models (gpt-5-mini, o-series) consume thousands of reasoning tokens on
+# LightRAG's 14 KB system prompt, exhausting max_completion_tokens before any visible
+# output is produced → 0 entities extracted.  gpt-4.1-nano is fast and follows the
+# <|#|> / <|COMPLETE|> format reliably.
+# Set LIGHTRAG_EXTRACT_MODEL in .env to override; falls back to OPENAI_MODEL.
+_EXTRACT_MODEL = os.getenv("LIGHTRAG_EXTRACT_MODEL") or _LLM_MODEL
 
 # Separate clients with different timeouts
 _oai_embeddings = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""), timeout=300.0)
@@ -16,7 +28,7 @@ async def gpt41_nano_complete(
     history_messages: list[dict] = [],
     **kwargs,
 ) -> str:
-    """Custom LLM function for gpt-4.1-nano via OpenAI SDK."""
+    """LightRAG entity/relation extraction. Uses LIGHTRAG_EXTRACT_MODEL (non-reasoning)."""
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -25,10 +37,10 @@ async def gpt41_nano_complete(
 
     try:
         response = await _oai_llm.chat.completions.create(
-            model="gpt-4.1-nano",
+            model=_EXTRACT_MODEL,
             messages=messages,
-            temperature=kwargs.get("temperature", 0.0),
-            max_tokens=kwargs.get("max_tokens", 2000),
+            temperature=kwargs.get("temperature", 0),
+            max_completion_tokens=kwargs.get("max_completion_tokens", 8000),
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -50,20 +62,22 @@ async def openai_embed(texts: list[str]) -> np.ndarray:
         raise
 
 
-# Initialize LightRAG with GPT-4.1-nano and OpenAI embeddings
-# Timeouts are configured at the OpenAI client level (_oai_embeddings, _oai_llm)
-rag = LightRAG(
-    working_dir="./data/lightrag",
-    llm_model_func=gpt41_nano_complete,
-    embedding_func=EmbeddingFunc(
-        embedding_dim=1536,
-        max_token_size=8192,
-        func=openai_embed,
-    ),
-    chunk_token_size=1200,
-    chunk_overlap_token_size=100,
-    rerank_model_func=None,
-)
+def _create_rag() -> LightRAG:
+    return LightRAG(
+        working_dir="./data/lightrag",
+        llm_model_func=gpt41_nano_complete,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=1536,
+            max_token_size=8192,
+            func=openai_embed,
+        ),
+        chunk_token_size=1200,
+        chunk_overlap_token_size=100,
+        rerank_model_func=None,
+    )
+
+
+rag = _create_rag()
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +133,13 @@ def _filter_context_by_intent(
             step_relevant = [c for c in relevant if step_tag in c]
             if step_relevant:
                 relevant = step_relevant
+            else:
+                # Intent-matched chunks exist but none belong to this step.
+                # Return empty so the step fallback in search_docs can retrieve
+                # step-specific content via a broader query instead of serving an
+                # off-topic chunk (e.g. "Ситуация 4" for a Шаг 5 query, or
+                # a Шаг 2 chunk for a Шаг 1 query in РЭН).
+                return ""
         if relevant:
             return header + "".join(relevant)
         # Chunks found but none match intent — safer than returning unrelated service content.
@@ -145,6 +166,16 @@ async def initialize():
     except Exception as e:
         print(f"❌ LightRAG initialization failed: {str(e)}")
         raise
+
+
+async def reinitialize():
+    """Wipe data/lightrag/ and create a fresh LightRAG instance. Called by /reindex."""
+    global rag
+    import shutil
+    shutil.rmtree("./data/lightrag", ignore_errors=True)
+    rag = _create_rag()
+    await rag.initialize_storages()
+    print("✅ LightRAG reinitialized (fresh)")
 
 
 async def search_docs(
@@ -207,41 +238,57 @@ async def search_docs(
         raw_chunk_count = len(_re_diag.findall(r'\{"reference_id"', raw_context))
         print(f"DEBUG — LightRAG hybrid raw_chunks={raw_chunk_count}, raw_len={len(raw_context)}")
 
-        # Naive fallback for step-specific queries when hybrid returns 0 text chunks.
-        #
-        # When hybrid returns 0 vector chunks it falls back to entity-related chunks,
-        # which are biased toward Step-1 entities (ФИО/ИИН dominate the graph).
-        # Naive mode skips graph traversal and uses direct vector similarity against
-        # the indexed text chunks, giving step-specific content a fair ranking.
-        # We use a minimal natural-language query so the embedding closely matches
-        # the document step content rather than the metadata-tag-heavy enriched query.
-        if raw_chunk_count == 0 and current_step is not None:
-            naive_query = f"шаг {current_step} {query}"
-            naive_result = await rag.aquery(
-                naive_query,
-                param=QueryParam(mode="naive", only_need_context=True, top_k=top_k),
-            )
-            naive_raw = naive_result if isinstance(naive_result, str) else str(naive_result)
-            naive_chunks = len(_re_diag.findall(r'\{"reference_id"', naive_raw))
-            print(f"DEBUG — naive fallback step={current_step}: found {naive_chunks} chunks")
-            if naive_chunks > 0:
-                raw_context = naive_raw
-                raw_chunk_count = naive_chunks
-
-        # Filter out chunks from unrelated services to avoid mixed templates
+        # Apply intent + step filter immediately after hybrid retrieval.
+        # Filtering first (before the fallback check) lets us measure how many
+        # step-relevant chunks hybrid actually returned.
         context = raw_context
         if intent:
             context = _filter_context_by_intent(raw_context, intent, current_step=current_step)
 
-        log_rag_search(query, intent or "none", language or "auto", len(context.split("\n")))
-
         filtered_chunk_count = len(_re_diag.findall(r'\{"reference_id"', context))
         print(f"DEBUG — after_filter chunks={filtered_chunk_count}, context_len={len(context)}, preview={context[:200] if context else 'EMPTY'}")
 
+        # Step-specific fallback: when the hybrid result yields 0 step-specific chunks,
+        # retry with a clean natural-language query and doubled top_k.
+        #
+        # Threshold is == 0 (not <= 1) because:
+        #   - The strict step filter (else: return "") already ensures that any chunk
+        #     that passes the filter genuinely belongs to "Шаг N" — a wrong chunk can
+        #     never survive (e.g. "Ситуация 4" for step 4 returns "" not 1 chunk).
+        #   - Each ingested step section is exactly 1 chunk (all sections fit within
+        #     LightRAG's chunk_token_size=1200). When 1 correct chunk is found, it is
+        #     complete and a second query is wasteful.
+        #   - <= 1 caused every step request to make 2 LightRAG calls.
+        #
+        # Why clean query? The "[TITLE: Шаг N] [INTENT:]" prefix causes LightRAG's
+        # entity extractor to anchor on "Шаг 1" (most-connected entity) for all steps.
+        # A plain "Шаг N <query>" lets the extractor find the right step cleanly.
+        # Why top_k * 2? The correct step chunk may rank 21+ and be cut off at top_k=20.
+        if current_step is not None and filtered_chunk_count == 0:
+            fallback_query = f"Шаг {current_step} {query}"
+            fallback_result = await rag.aquery(
+                fallback_query,
+                param=QueryParam(mode="hybrid", only_need_context=True, top_k=top_k * 2),
+            )
+            fallback_raw = fallback_result if isinstance(fallback_result, str) else str(fallback_result)
+            fallback_context = (
+                _filter_context_by_intent(fallback_raw, intent, current_step=current_step)
+                if intent else fallback_raw
+            )
+            fallback_chunks = len(_re_diag.findall(r'\{"reference_id"', fallback_context))
+            print(f"DEBUG — step fallback step={current_step} top_k={top_k * 2}: found {fallback_chunks} chunks (main had {filtered_chunk_count})")
+            if fallback_chunks > filtered_chunk_count:
+                context = fallback_context
+                filtered_chunk_count = fallback_chunks
+
+        log_rag_search(query, intent or "none", language or "auto", len(context.split("\n")))
+
+        print(f"DEBUG — final chunks={filtered_chunk_count}, context_len={len(context)}")
+
         if intent and raw_chunk_count > 0 and filtered_chunk_count == 0:
-            print(f"⚠️  All {raw_chunk_count} chunks filtered out for intent={intent}. Check intent tags in indexed documents.")
+            print(f"⚠️  All {raw_chunk_count} hybrid chunks filtered out for intent={intent}, step={current_step}. Fallback also found 0.")
         elif raw_chunk_count == 0:
-            print(f"⚠️  Both hybrid and naive returned 0 text chunks. top_k={top_k}, intent={intent}, step={current_step}")
+            print(f"⚠️  LightRAG returned 0 entity-related chunks. top_k={top_k}, intent={intent}, step={current_step}")
 
         return context if context else ""
 
