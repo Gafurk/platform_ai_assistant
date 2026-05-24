@@ -1,193 +1,333 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code sessions working in this repository.
 
-## Dev commands
+---
+
+## Project Overview
+
+FastAPI RAG-based AI assistant for the **iSEL** platform. Responds in Russian and Kazakh. Uses LightRAG (graph + vector hybrid) backed by OpenAI for entity extraction and embeddings. Entry point: `app/main.py`.
+
+Demo UI: `http://localhost:8001/static/index.html` — glassmorphism floating chat widget.  
+Health check: `GET /health` → `{"status": "ok", "service": "isel-bot"}`.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| API framework | FastAPI + Uvicorn |
+| RAG / KG | LightRAG-HKU (hybrid: graph traversal + nano-vectordb) |
+| LLM / Embeddings | OpenAI (`gpt-4.1-nano` for extraction, configurable model for chat) |
+| Session state | In-memory (`SessionManager`) — lost on restart |
+| Frontend | Vanilla HTML/CSS/JS (glassmorphism) |
+| Streaming | Server-Sent Events (SSE) for reindex status |
+| Config | YAML files (`config/services.yaml`, `config/keywords.yaml`) |
+
+---
+
+## Dev Commands
 
 ```bash
 # Activate venv (run once per shell session)
-venv/Scripts/activate             # bash/Git Bash
-venv\Scripts\Activate.ps1         # PowerShell
+venv\Scripts\Activate.ps1           # PowerShell
+venv/Scripts/activate               # bash/Git Bash
 
 # Install dependencies (one-time)
-pip install lightrag-hku openai pypdf python-docx
+pip install -r requirements.txt
 
-# Start the API server
+# Start API server
 uvicorn app.main:app --reload --port 8001
-
-# Ingest documents into LightRAG
-python ingestion/ingest.py
 
 # Run tests
 python -m pytest tests/ -v
+
+# Manual bulk ingestion (from scratch or after reindex wipe)
+python ingestion/ingest.py
 ```
 
-## External services
+---
 
-**NO external services required.** LightRAG uses:
-- **Local graph store** — embedded NetworkX graph + persistent storage in `./data/lightrag/`
-- **Local vector DB** — embedded nano-vectordb in `./data/lightrag/`
-- **OpenAI API** — gpt-4.1-nano for LLM, text-embedding-3-small for embeddings
+## Environment Variables (`.env`)
 
-The working directory `./data/lightrag/` is created automatically on first run.
-
-## .env variables
-
-```
-OPENAI_API_KEY=sk-...       # Required — your OpenAI API key
-LLM_PROVIDER=openai         # "openai" only (ollama legacy, not recommended)
-OPENAI_MODEL=gpt-4.1-nano   # Model for both entity extraction and LLM responses
-```
-
-## Architecture
-
-FastAPI RAG-based AI assistant for the iSEL platform. Responds in Russian (RU) and Kazakh (KZ).
-
-**Demo UI:** `http://localhost:8001/static/index.html` — glassmorphism floating widget (FAB bottom-right).
-
-**Health check:** `GET /health` returns `{"status": "ok", "service": "isel-bot"}`.
-
-### Request pipeline (`POST /api/v1/chat`)
-
-```
-validate → rate_limit → rule_based → FAQ interruption? → intent classify
-→ entity detect → clarification gate → flow.next_state() → RAG → LLM
+```env
+OPENAI_API_KEY=sk-...                    # Required
+LLM_PROVIDER=openai                      # "openai" (default) or "ollama"
+OPENAI_MODEL=gpt-4.1-nano                # Model for LLM chat responses
+LIGHTRAG_EXTRACT_MODEL=gpt-4.1-nano      # Model for LightRAG entity/relation extraction
+                                         # Must be a NON-reasoning model — reasoning models
+                                         # exhaust max_completion_tokens on LightRAG's 14 KB
+                                         # system prompt before producing any output.
+OLLAMA_BASE_URL=http://localhost:11434   # Fallback only
+OLLAMA_MODEL=llama3.2                    # Fallback only
 ```
 
-Input: `ChatRequest(message, session_id, page?, language?)`.
-Response: `ChatResponse(answer, source, handoff)` — `source` is `"rule_based"`, `"faq_interruption"`, or `"llm"`.
+---
 
-Language is **auto-detected** from the incoming `message` via `_detect_language()`, which checks for Kazakh-specific Cyrillic characters (ә ғ қ ң ө ұ ү і). The `language` field in `ChatRequest` is accepted but not used.
+## Important Directories
 
-Sessions are **in-memory** (lost on server restart). Managed by `app/services/session.py` `SessionManager`.
-
-### Layer 1 — Rule-based filter (`services/rulebased.py`)
-
-Two dictionaries checked before any RAG or LLM call:
-
-**`SYSTEM_COMMANDS`** — identity, greetings, handoff  
-Keys matched by longest-first substring search. Covers `привет`, `салем`, `спасибо`, `рахмет`, `оператор`, etc.
-
-**`NAVIGATION_RULES`** — canonical platform navigation paths  
-Exact answers for status/document/refusal queries — zero LLM tokens.
-
-| Trigger phrase | Answer |
+| Path | Purpose |
 |---|---|
-| `статус заявки`, `статус обращения`, `где моя заявка` | Path to Услуги → Обращения |
-| `мотивированный отказ`, `скачать отказ` | Path + Скачать/Просмотр instruction |
-| `скачать технические условия`, `скачать тУ`, `готовые тУ` | Path + Скачать/Просмотр instruction |
-| Kazakh equivalents | Same answers in Kazakh |
+| `app/routers/` | FastAPI route handlers (`chat.py`, `documents.py`) |
+| `app/services/` | Business logic: LightRAG, LLM, session, rule-based, rate limit |
+| `app/flows/` | Intent-based state machines (`linear.py`, `scenario.py`, `faq.py`) |
+| `app/config/` | `ServiceRegistry` singleton — loads YAML configs once at import |
+| `config/` | `services.yaml` (services + nav paths), `keywords.yaml` (intent keywords) |
+| `ingestion/` | Document chunking + LightRAG insertion pipeline |
+| `frontend/` | Static UI — **must exist** before server start (StaticFiles mount fails otherwise) |
+| `data/docs/` | Staging area for uploaded raw documents |
+| `data/lightrag/` | **Persistent KG storage** (graph + embeddings) — **back this up** |
+| `tests/` | pytest test suite (200+ tests, ~95% pass rate) |
 
-**Rule:** Do NOT add navigation paths to `app/flows/`. Flows are state machines. Navigation facts belong in `rulebased.py` (for exact matches) and `llm_service.py` `<navigation_facts>` (for contextual use).
+---
 
-### Layer 2 — Flow engine (`app/flows/`)
+## Architecture & Request Pipeline
 
-**`FlowState`** (in `models/schemas.py`): `intent`, `entity`, `step`, `situation`, `locked`
+```
+POST /api/v1/chat
+  │
+  ├─ validate (ChatRequest)
+  ├─ rate_limit (per session_id)
+  ├─ rule_based → SYSTEM_COMMANDS / NAVIGATION_RULES   ← returns immediately if matched
+  ├─ language detect (_detect_language — Kazakh Cyrillic: ә ғ қ ң ө ұ ү і)
+  ├─ intent classify (sticky + keyword switch + page fallback)
+  ├─ navigation FAQ shortcut (status/download queries → nav path, no LLM)
+  ├─ FAQ interruption gate (locked flow + no flow keywords → FAQFlow, preserve state)
+  ├─ entity detect (ФЛ/ЮЛ from message + history)
+  ├─ entity clarification gate (TU application blocks until entity known)
+  ├─ flow.next_state() (LinearFlow / ScenarioFlow / FAQFlow)
+  ├─ flow lock (state.locked=True once step≥1 or situation chosen)
+  ├─ search_docs() — LightRAG hybrid + intent/step filter + step fallback
+  ├─ ask_llm() — OpenAI with static cached prompt + dynamic suffix
+  └─ session.update() (state + history)
+```
 
-**Flow types:**
+**Response:** `ChatResponse(answer, source, handoff)`  
+`source` values: `"rule_based"` | `"faq_interruption"` | `"llm"`
 
-| Intent | Flow class | Behavior |
+---
+
+## Document Upload & Reindex Flow
+
+### Upload (incremental, no auto-index)
+
+```
+POST /api/v1/upload
+  → file saved as data/docs/{uuid}_{original_name}
+  → TaskQueue.submit(_run_ingestion)   ← max 2 concurrent
+  → ingest_file() [async]
+    → split_by_situations() — situation blocks → meta blocks → 800-word fallback chunks
+    → rag.ainsert(chunk) × N   ← adds to KG, never wipes
+```
+
+Deleting via `DELETE /api/v1/documents/{filename}` removes the file from disk only — **does not** remove KG nodes from LightRAG.
+
+### Reindex (full wipe + rebuild via SSE)
+
+The `/reindex` endpoint performs a complete rebuild and streams progress via **Server-Sent Events**:
+
+```
+POST /api/v1/reindex
+  → wipe data/lightrag/ directory entirely
+  → reinitialize LightRAG (lightrag_service.initialize())
+  → for each file in data/docs/:
+      → ingest_file(filepath)         ← try/except per file so one failure doesn't stop all
+      → yield SSE: {"status": "progress", "file": name, "done": N, "total": M}
+  → yield SSE: {"status": "done"}     ← guaranteed via finally block
+```
+
+**SSE event format:**
+```
+data: {"status": "progress", "file": "...", "done": 1, "total": 5}\n\n
+data: {"status": "ping"}\n\n          ← heartbeat every ~15s to keep connection alive
+data: {"status": "done"}\n\n          ← always sent, even on error
+```
+
+**Frontend** handles `EventSource` `onerror` by calling `source.close()` and unlocking the UI immediately (graceful degradation — never leave the reindex button disabled on failure).
+
+---
+
+## Chunking Strategy (`split_by_situations()`)
+
+1. **Situation blocks** (`Ситуация \d+`, `Жағдай \d+`, `Шаг \d+`) — each block is one LightRAG insert.
+2. **Meta blocks** (`Цель интента`, `Мақсаты`, `Требования`) — lower priority.
+3. **Deduplication** — keeps highest-quality version of duplicate situations.
+4. **Fallback** — 800-word fixed chunks (overlap=100) if no headers found.
+
+Each chunk is inserted with a metadata header:
+```
+[FILENAME: file.pdf] [INTENT: tu_application] [LANGUAGE: ru] [TITLE: Ситуация 1]
+{chunk text}
+```
+
+---
+
+## LightRAG Search Pipeline
+
+`search_docs()` in `app/services/lightrag_service.py`:
+
+1. **Query enrichment** — prepend `[TITLE: Шаг N]`, `[INTENT: slug]`, `[entity]` to query.
+2. **Hybrid search** — graph traversal + vector similarity (`only_need_context=True`, `top_k=20`).
+3. **Intent filter** (`_filter_context_by_intent`) — keep only chunks whose `[INTENT:]` tag matches.
+4. **Step filter** — if `current_step` set, further keep only chunks containing `Шаг N`; return `""` if none (triggers fallback).
+5. **Step fallback** — if `filtered_chunk_count == 0`: retry with plain `"Шаг N {query}"`, `top_k*2`, no metadata prefix.
+
+`rerank_model_func=None` — reranking disabled (no reranker available).
+
+**Why two OpenAI clients in `lightrag_service.py`?**  
+`_oai_embeddings` (timeout=300s) and `_oai_llm` (timeout=600s) are separate because LightRAG's entity extraction can be slow on large documents; a shared short-timeout client would abort extractions mid-run.
+
+---
+
+## LLM Service (`app/services/llm_service.py`)
+
+- **OpenAI:** `temperature=1`, `max_completion_tokens=8000`, timeout=90s.
+- **Ollama:** `temperature=0.0`, timeout=180s.
+
+8000 tokens required for reasoning models (gpt-5-mini, o-series): they consume 3000–5000 internal reasoning tokens before producing visible output.
+
+---
+
+## Prompt Architecture (OpenAI prefix caching)
+
+```
+STATIC BASE (identical per language → OpenAI cache hit):
+  <role> <language_rule> <intent_handling> <navigation_facts> <rules> <formatting>
+
+DYNAMIC SUFFIX (per request):
+  <history>         last 3 turns
+  <intent_context>  intent / entity / page / situation
+  <step_control>    current step number + "Далее" button instruction
+```
+
+Navigation facts are **auto-generated** from `ServiceRegistry` (reads `services.yaml`). Add new paths to `services.yaml`, not to `prompt_builder.py` directly.
+
+---
+
+## Flow System
+
+### Flow types
+
+| Intent | Class | Behavior |
 |---|---|---|
-| `tu_application` | `LinearFlow` | 5 steps, entity required, step increments on "дальше"/"да"/etc. |
-| `real_estate` | `ScenarioFlow` | Branching situations, asks clarifying question, uses last-turn context in query |
-| `None` | `FAQFlow` | Pure retrieval, no state tracking |
+| `tu_application` | `LinearFlow` | 5 steps; entity (ФЛ/ЮЛ) required before step 1; advances on "дальше"/"да" |
+| `real_estate` | `ScenarioFlow` | Branching (cadastre vs address register); stores `original_question` |
+| `None` | `FAQFlow` | Pure retrieval; no state tracking |
 
-**FAQ interruption:** When `state.locked=True` and the message has no flow keywords and is not a step phrase, the system answers via `FAQFlow` without disturbing the active flow state. History-only update preserves the step position.
-
-**Intent locking:** Once step≥1 starts for TU or situation is active for real estate, `state.locked=True` prevents accidental intent resets.
-
-**`registry.py`** exports:
-- `get_flow(intent)` — returns the flow handler
-- `classify_intent(message, page, current_intent)` — sticky intent with explicit-switch override
-- `has_flow_keywords(message)` — used by FAQ interruption gate
-
-### Layer 3 — RAG retrieval (`services/rag.py` → `services/lightrag_service.py`)
-
-LightRAG `hybrid` mode — combines graph traversal + vector similarity.
-
-Query enrichment order: `[Шаг N]` → `[intent]` → `[entity]` → user message.
-
-`rerank_model_func=None` — reranking disabled (no reranker model available).
-
-Returns raw context string (`only_need_context=True`). Empty context falls back to `"Контекст недоступен."`.
-
-### Layer 4 — LLM generation (`services/llm_service.py`)
-
-**Prompt structure** (for OpenAI prefix caching):
-
-```
-_STATIC_PROMPT_RU / _STATIC_PROMPT_KZ   ← identical per language — cached by OpenAI
-  <role>
-  <language_rule>
-  <navigation_facts>                      ← canonical paths for status/documents
-  <intent_handling>
-  <rules> (13 rules)
-  <formatting>
-
-  + per-request dynamic suffix:
-  <history>         (if any)
-  <intent_context>  (if intent/entity/page set)
-  <step_control>    (if current_step set)
-    → step 5: includes navigation hint to Услуги → Обращения
-```
-
-Temperature `0.0`. Max tokens `1000`. Timeout `30s` (OpenAI) / `180s` (Ollama).
-
-### Session management (`services/session.py`)
-
-`SessionManager` has three update modes:
+### Session update modes
 
 | Method | When | Effect |
 |---|---|---|
 | `update()` | Normal LLM turn | State + history |
-| `update_state_only()` | Clarification gate (no bot message) | State only |
-| `update_history_only()` | FAQ interruption | History only (flow state preserved) |
+| `update_state_only()` | Clarification gate (no bot answer yet) | State only |
+| `update_history_only()` | FAQ interruption (flow active) | History only — flow state preserved |
 
-History capped at 20 entries (10 turns). `cleanup()` removes sessions idle > 24 hours.
+History capped at 10 entries (5 turns).
 
-### Document API (`routers/documents.py`)
+---
 
-- `POST /api/v1/upload` — saves file with `{uuid}_{original_name}` to `data/docs/`, queues ingestion via `TaskQueue` (max 2 concurrent)
-- `GET /api/v1/documents` — lists files in `data/docs/`
-- `DELETE /api/v1/documents/{filename}` — removes file from disk only (**does not** remove KG nodes from LightRAG)
+## Layer 1 — Rule-Based Filter (`services/rulebased.py`)
 
-### Ingestion pipeline (`ingestion/ingest.py`)
+Two dicts checked **before** any RAG or LLM call:
 
-Each run **incrementally adds** documents to the knowledge graph (no wipe).
+- **`SYSTEM_COMMANDS`** — identity, greetings, handoff. Matched by longest-first substring.
+- **`NAVIGATION_RULES`** — exact answers for status/document/refusal queries (zero LLM tokens).
 
-**Chunking strategy** (`split_by_situations()`):
-1. **Situation blocks** (`Ситуация \d+`, `Жағдай \d+`) — each gets its own LightRAG insert with metadata header.
-2. **Meta blocks** (`Цель интента`, `Мақсаты`, `Требования`) — added at lower priority.
-3. **Fallback** — 800-word fixed chunks with 100-word overlap if no situation headers found.
+**Rule:** Do NOT put navigation paths in `app/flows/`. Flows handle routing only. Navigation facts belong in:
+1. `rulebased.py` `NAVIGATION_RULES` (exact match, no LLM).
+2. `services.yaml` `navigation_path` (used by prompt builder for contextual LLM flows).
 
-Each chunk inserted with:
-```
-[FILENAME: {filename}] [INTENT: {intent_slug}] [LANGUAGE: {language}] [TITLE: {title}]
-{chunk_text}
-```
+---
 
-## Key constraints
+## Adding New Navigation Rules
 
-- All packages under `app/` have `__init__.py` — do not delete them.
-- `frontend/` directory must exist before starting the server (`StaticFiles` mount fails otherwise).
-- `data/docs/` is the staging area for raw documents; deleting via API does **not** clean LightRAG KG nodes.
-- `data/lightrag/` is the persistent KG storage — **back this up**; it contains all indexed content.
-- LightRAG ingestion triggers gpt-4.1-nano calls — expect ~0.5–2 USD per 100KB document.
-- `OPENAI_API_KEY` **must** be set in `.env`.
+1. Add answer string to `NAVIGATION_RULES` in `rulebased.py`.
+2. Add Russian and Kazakh trigger phrases.
+3. If relevant during LLM flows, also add to `services.yaml` → `navigation_path`.
+4. Do **not** add to `app/flows/`.
 
-## Adding new navigation rules
-
-When a new platform path needs to be surfaced to users:
-
-1. Add the answer string to `rulebased.py` `NAVIGATION_RULES` dict.
-2. Add both Russian and Kazakh trigger phrases.
-3. If the path is relevant during LLM flows (not just direct questions), also add to `<navigation_facts>` in `llm_service.py` static prompts.
-4. Do **not** add navigation content to `app/flows/` — flows handle routing only.
-
-## Adding a new flow type
+## Adding a New Flow Type
 
 1. Create `app/flows/myflow.py` inheriting `BaseFlow`.
-2. Override `next_state()`, `build_query()`, and optionally `is_step_progression()`.
+2. Override `next_state()`, `build_query()`, optionally `is_step_progression()`.
 3. Register in `app/flows/registry.py` `_FLOWS` dict.
 4. Add intent keywords to `INTENT_KEYWORDS` in `registry.py`.
 5. Add tests in `tests/test_flows.py`.
+
+---
+
+## Code Style & Conventions
+
+These rules are **strict** — apply them to all new and modified code.
+
+### Async correctness
+
+Always use `await asyncio.sleep()`. Never `time.sleep()` inside async functions — it blocks the event loop and freezes all SSE connections.
+
+### Batch loop error isolation
+
+Wrap each iteration of a batch/file loop in its own `try/except`. One bad document must not abort an entire reindex or ingestion run.
+
+```python
+for file in files:
+    try:
+        await ingest_file(file)
+    except Exception as e:
+        logger.error(f"Failed {file}: {e}")
+        continue
+```
+
+### SSE — always send `done`
+
+The `done` event **must** be sent on every SSE code path: success, partial failure, and uncaught exception. Use `finally` as a safety net. If the frontend never receives `done`, the UI stays locked indefinitely.
+
+```python
+async def reindex_stream():
+    try:
+        # ... work ...
+        yield 'data: {"status": "done"}\n\n'
+    except Exception as e:
+        yield f'data: {{"status": "error", "message": "{e}"}}\n\n'
+        yield 'data: {"status": "done"}\n\n'
+```
+
+### SSE — heartbeat/ping
+
+Send `data: {"status": "ping"}\n\n` every ~15 seconds during long operations to prevent proxy/browser timeouts from silently killing the connection.
+
+### Frontend graceful degradation
+
+On `EventSource` `onerror` or explicit `close()`, always unlock the UI (re-enable buttons, hide spinners). Never leave the user with a frozen interface.
+
+```js
+source.onerror = () => {
+    source.close();
+    unlockUI();   // always — regardless of whether done was received
+};
+```
+
+---
+
+## Key Constraints
+
+- All packages under `app/` have `__init__.py` — do not delete them.
+- `frontend/` directory **must** exist before server start (`StaticFiles` mount raises on missing dir).
+- `data/lightrag/` is the persistent KG — **back it up before any wipe**.
+- LightRAG ingestion triggers OpenAI calls (entity extraction) — ~0.5–2 USD per 100 KB document.
+- `DELETE /api/v1/documents/{filename}` removes the file only — KG nodes remain until full reindex.
+- `LIGHTRAG_EXTRACT_MODEL` **must** be a non-reasoning model. Reasoning models exhaust `max_completion_tokens` on LightRAG's 14 KB extraction prompt before writing any output → 0 entities extracted.
+- Do not add navigation paths to `app/flows/` — flows handle state transitions only.
+
+---
+
+## External Services
+
+No external vector DB or graph DB. Everything is local:
+
+| Component | Implementation |
+|---|---|
+| Graph store | NetworkX (embedded, persisted to `data/lightrag/`) |
+| Vector DB | nano-vectordb (embedded, persisted to `data/lightrag/`) |
+| LLM | OpenAI API (required) |
+| Embeddings | OpenAI `text-embedding-3-small` |

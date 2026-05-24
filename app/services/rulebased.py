@@ -109,13 +109,78 @@ NAVIGATION_RULES: dict[str, dict] = {
 
 
 def check_rule(message: str) -> tuple[str | None, bool]:
-    msg = message.lower().strip()
+    """
+    Return (answer, handoff) if the message matches a rule, else (None, False).
 
-    # Check both dicts; longest key wins in both — prevents short keys shadowing longer ones.
-    combined = {**SYSTEM_COMMANDS, **NAVIGATION_RULES}
-    for key in sorted(combined.keys(), key=len, reverse=True):
-        if key in msg:
-            val = combined[key]
+    Four passes in priority order:
+
+    1. NAVIGATION_RULES — substring, longest-key-first.
+       Navigation phrases are specific enough that substring presence anywhere
+       in the message is intentional and always wins over greetings.
+
+    2. IDENTITY_KEYS — word-sequence match (exact tokens), longest-key-first.
+       Checked before OPERATOR_KEYS so "ты бот или человек" correctly returns
+       the identity answer instead of the operator answer.
+
+    3. OPERATOR_KEYS {"оператор", "человек", "поддержка"} — substring match.
+       Substring (not token) is used intentionally to catch inflected Cyrillic
+       forms: "оператором", "поддержки", etc.  Always fires regardless of
+       message length — a user requesting a human agent is always valid.
+
+    4. GREETING_KEYS {"привет", "здравствуйте", "салем", "спасибо", "рахмет",
+       "выход"} — exact token match + content-word guard.
+       Only fires when the message contains fewer than 2 "content" words
+       (words not in SOCIAL_FILLER).  This prevents:
+           "привет подскажи как пользоваться ЭЦП"  →  real question, skip rule
+       while still catching:
+           "привет"                                 →  greeting, answer immediately
+           "спасибо за помощь"                      →  thanks (1 content word)
+    """
+    import re
+
+    msg_lower = message.lower().strip()
+    # Tokenize: strip punctuation, split on whitespace
+    words = re.sub(r"[^\w\s]", " ", msg_lower).split()
+
+    # ── 1. Navigation rules — substring, longest key wins ───────────────────
+    for key in sorted(NAVIGATION_RULES.keys(), key=len, reverse=True):
+        if key in msg_lower:
+            val = NAVIGATION_RULES[key]
+            return val["answer"], val["handoff"]
+
+    # ── Classify SYSTEM_COMMANDS into buckets ────────────────────────────────
+    OPERATOR_KEYS = {"оператор", "человек", "поддержка"}
+    GREETING_KEYS = {"привет", "здравствуйте", "салем", "спасибо", "рахмет", "выход"}
+    IDENTITY_KEYS = {k for k in SYSTEM_COMMANDS if k not in OPERATOR_KEYS and k not in GREETING_KEYS}
+
+    # ── 2. Identity keys — word-sequence, longest key wins ──────────────────
+    for key in sorted(IDENTITY_KEYS, key=len, reverse=True):
+        key_tokens = key.split()
+        for i in range(len(words) - len(key_tokens) + 1):
+            if words[i: i + len(key_tokens)] == key_tokens:
+                val = SYSTEM_COMMANDS[key]
+                return val["answer"], val["handoff"]
+
+    # ── 3. Operator keys — substring (handles inflected Cyrillic forms) ──────
+    for key in sorted(OPERATOR_KEYS, key=len, reverse=True):
+        if key in msg_lower:
+            val = SYSTEM_COMMANDS[key]
+            return val["answer"], val["handoff"]
+
+    # ── 4. Greeting keys — exact token + content-word guard ─────────────────
+    # Words that do not count as "real content" when deciding if the message
+    # is a pure greeting or carries a substantive question.
+    SOCIAL_FILLER = {
+        "привет", "здравствуйте", "салем", "спасибо", "рахмет", "выход",
+        "пожалуйста", "добрый", "добрая", "доброе", "день", "утро", "вечер",
+        "ночь", "хорошо", "ладно", "ок", "окей", "за", "большое", "вам",
+    }
+    content_words = [w for w in words if w not in SOCIAL_FILLER]
+    greeting_only = len(content_words) < 2  # < 2 real words → treat as pure greeting
+
+    for key in sorted(GREETING_KEYS, key=len, reverse=True):
+        if key in words and greeting_only:
+            val = SYSTEM_COMMANDS[key]
             return val["answer"], val["handoff"]
 
     return None, False

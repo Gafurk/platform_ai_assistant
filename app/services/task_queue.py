@@ -14,7 +14,7 @@ class TaskQueue:
 
     async def submit(self, coro):
         """Submit a coroutine to the queue."""
-        await self.queue.append(coro)
+        self.queue.append(coro)
         await self._process_queue()
 
     async def _process_queue(self):
