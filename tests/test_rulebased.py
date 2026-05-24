@@ -164,11 +164,11 @@ class TestFilterContextByIntent:
         assert "ФИО" in result
         assert "Добавьте объект" not in result
 
-    def test_no_match_returns_full_context(self):
+    def test_no_match_returns_empty(self):
         ctx = self._context(self._RE_CHUNK)
         result = _filter_context_by_intent(ctx, "tu_application")
-        # Falls back to full context — better than empty
-        assert result == ctx
+        # Returns empty string — safer than returning unrelated service content
+        assert result == ""
 
     def test_none_intent_returns_full_context(self):
         ctx = self._context(self._TU_CHUNK, self._RE_CHUNK)
@@ -205,3 +205,76 @@ class TestFilterContextByIntent:
         ctx = self._context(chunk, self._TU_CHUNK)
         result = _filter_context_by_intent(ctx, "supply_contract_non_residential")
         assert "Небытовой договор" in result
+
+    # --- entity-only context (0 vector chunks from LightRAG) ---
+
+    def test_entity_only_context_passes_through(self):
+        # When LightRAG returns entity-only context (no [INTENT:] tags, no reference_id),
+        # the filter must NOT return "" — it should return the full context so the LLM
+        # can use entity descriptions instead of getting an empty context.
+        entity_ctx = '{"entity": "ФИО заявителя", "description": "Поле заявителя на Шаге 1 ТУ"}'
+        result = _filter_context_by_intent(entity_ctx, "tu_application")
+        assert result == entity_ctx
+
+    def test_entity_only_multi_entity_passes_through(self):
+        entity_ctx = "\n\n".join([
+            '{"entity": "Подписание", "description": "Финальный шаг подачи заявления"}',
+            '{"entity": "ИИН", "description": "Идентификационный номер физлица"}',
+        ])
+        result = _filter_context_by_intent(entity_ctx, "load_calculation")
+        assert result == entity_ctx
+
+    # --- step-level filtering (Ошибка 1: TU steps 4/5 swap) ---
+    # Chunks must use the real LightRAG JSON format ({"reference_id":...}) so
+    # the tests exercise the JSON path where step filtering is applied.
+
+    # Build a fake reference_id JSON chunk that the filter's JSON path will pick up.
+    @staticmethod
+    def _ref_chunk(intent: str, title: str, body: str) -> str:
+        # Intentionally NOT valid JSON — the filter only checks string containment,
+        # not JSON parsing. The chunk just needs to start with {"reference_id" and
+        # contain the expected [INTENT:] / [TITLE:] / body text.
+        return (
+            f'{{"reference_id": "test", "content": '
+            f'"[FILENAME: tu.txt] [INTENT: {intent}] [LANGUAGE: ru] [TITLE: {title}] {body}"}}'
+        )
+
+    def test_step_filter_prefers_matching_step_chunk(self):
+        # "Ситуация 4" terminology block (same intent, no "Шаг 4" inside text)
+        # must be excluded when current_step=4 and a proper Шаг-4 chunk exists.
+        step4 = self._ref_chunk(
+            "tu_application",
+            "3.5 Пользователь (Шаг 4)",
+            "Очереди строительства",
+        )
+        terminology = self._ref_chunk(
+            "tu_application",
+            "Ситуация 4",
+            "Термины и определения Подписание заявления",
+        )
+        ctx = step4 + "\n" + terminology
+        result = _filter_context_by_intent(ctx, "tu_application", current_step=4)
+        assert "Очереди строительства" in result
+        assert "Подписание заявления" not in result
+
+    def test_step_filter_returns_empty_when_no_step_match(self):
+        # When intent-matched chunks exist but NONE contain "Шаг N", return ""
+        # so search_docs can trigger the step fallback query instead of serving
+        # an off-topic chunk (e.g. "Ситуация 4" for a Шаг 5 query, or a Шаг 2
+        # chunk for a Шаг 1 РЭН query).
+        chunk = self._ref_chunk(
+            "tu_application",
+            "Общая информация",
+            "Общий текст о ТУ без указания шага",
+        )
+        result = _filter_context_by_intent(chunk, "tu_application", current_step=3)
+        assert result == ""
+
+    def test_step_filter_none_step_does_not_narrow(self):
+        # Without current_step, all intent-matched chunks are returned.
+        step4 = self._ref_chunk("tu_application", "Шаг 4", "Очереди строительства")
+        step5 = self._ref_chunk("tu_application", "Шаг 5", "Подписание документов")
+        ctx = step4 + "\n" + step5
+        result = _filter_context_by_intent(ctx, "tu_application", current_step=None)
+        assert "Очереди строительства" in result
+        assert "Подписание документов" in result

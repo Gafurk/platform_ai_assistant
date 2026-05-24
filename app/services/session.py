@@ -89,7 +89,9 @@ class SessionManager:
         history = self._history.setdefault(session_id, [])
         history.append({"role": "user", "content": user_msg})
         history.append({"role": "assistant", "content": bot_msg})
-        self._history[session_id] = history[-20:]
+        # FIX #4A: Reduce history from 20 to 10 entries (max 5 turns)
+        # This prevents LLM from following historical patterns when processing long sessions
+        self._history[session_id] = history[-10:]
 
 
 # Module-level singleton — persists across FastAPI requests

@@ -311,6 +311,15 @@ class TestClassifyIntentKazakh:
     def test_meter_sealing_kz_meter_accusative(self):
         assert classify_intent("есептеуіш аспапты орнату", None, None) == "meter_sealing"
 
+    def test_draft_design_ru_genitive(self):
+        assert classify_intent("как подать заявку на разработку эскизного проекта", None, None) == "draft_design"
+
+    def test_draft_design_ru_accusative_verb(self):
+        assert classify_intent("хочу разработку эскизного пвэ", None, None) == "draft_design"
+
+    def test_construction_works_kz_latin_smr(self):
+        assert classify_intent("SMR - ге қалай жүгінуге болады", None, None) == "construction_works"
+
 
 class TestGetFlow:
     def test_tu_returns_linear(self):

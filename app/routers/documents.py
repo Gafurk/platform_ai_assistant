@@ -2,10 +2,13 @@ import os
 import shutil
 import uuid
 import asyncio
+import json
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from app.services.task_queue import ingestion_queue
-from app.utils.logger import log_document_upload, log_ingestion_start, log_ingestion_complete, log_ingestion_error
+from fastapi.responses import JSONResponse, StreamingResponse
+from app.utils.logger import (
+    log_document_upload, log_ingestion_start,
+    log_ingestion_complete, log_ingestion_error,
+)
 
 router = APIRouter()
 
@@ -15,8 +18,7 @@ SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx"}
 
 @router.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Upload a document and trigger ingestion into Qdrant."""
-
+    """Save document to data/docs/. Indexing happens on /reindex."""
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
@@ -33,16 +35,12 @@ async def upload_document(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, f)
 
         file_size_kb = os.path.getsize(file_path) / 1024
-        log_document_upload(safe_filename, round(file_size_kb, 1), "uploaded")
+        log_document_upload(safe_filename, round(file_size_kb, 1), "saved")
 
-        # Queue ingestion with concurrency limit
-        await ingestion_queue.submit(_run_ingestion(file_path, safe_filename))
-
-        queue_status = await ingestion_queue.get_status()
         return JSONResponse(content={
-            "status": "queued",
+            "status": "saved",
             "filename": safe_filename,
-            "message": f"File queued for ingestion. Active: {queue_status['active_tasks']}, Queued: {queue_status['queued_tasks']}"
+            "message": "Файл сохранён. Нажмите «Переиндексировать» для обновления графа знаний.",
         })
     except Exception as e:
         log_document_upload(safe_filename, 0, f"failed: {str(e)}")
@@ -64,7 +62,7 @@ async def list_documents():
             files.append({
                 "filename": filename,
                 "size_kb": round(os.path.getsize(filepath) / 1024, 1),
-                "extension": ext
+                "extension": ext,
             })
 
     return {"documents": files, "total": len(files)}
@@ -72,7 +70,7 @@ async def list_documents():
 
 @router.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    """Delete a document from disk."""
+    """Remove document from disk. Run /reindex to sync the knowledge graph."""
     filepath = os.path.join(DOCS_DIR, filename)
 
     if not os.path.exists(filepath):
@@ -82,15 +80,58 @@ async def delete_document(filename: str):
     return {"status": "deleted", "filename": filename}
 
 
-async def _run_ingestion(filepath: str, filename: str):
-    """Run ingestion for a single file."""
-    log_ingestion_start(filename)
+@router.post("/reindex")
+async def reindex():
+    """Wipe LightRAG KG and reindex all docs in data/docs/. Streams SSE progress."""
+    return StreamingResponse(
+        _reindex_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+async def _reindex_stream():
+    from app.services import lightrag_service
+    from ingestion.ingest import ingest_file
+
+    def evt(data: dict) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
     try:
-        from ingestion.ingest import ingest_file
-        result = await ingest_file(filepath, filename)
-        chunks_count = result.get("chunks_count", 0) if isinstance(result, dict) else 0
-        log_ingestion_complete(filename, chunks_count, "success")
-        print(f"✅ Ingestion complete for: {filename}")
+        yield evt({"status": "wiping"})
+        yield evt({"status": "init"})
+        await lightrag_service.reinitialize()
+
+        files = sorted([
+            f for f in os.listdir(DOCS_DIR)
+            if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+        ])
+        total = len(files)
+
+        if total == 0:
+            yield evt({"status": "done", "total": 0})
+            return
+
+        for i, filename in enumerate(files):
+            yield evt({"status": "progress", "file": filename, "done": i, "total": total})
+            try:
+                log_ingestion_start(filename)
+                result = await ingest_file(os.path.join(DOCS_DIR, filename), filename)
+                chunks = result.get("chunks_count", 0) if isinstance(result, dict) else 0
+                log_ingestion_complete(filename, chunks, "success")
+            except Exception as e:
+                log_ingestion_error(filename, str(e))
+                yield evt({"status": "file_error", "file": filename, "error": str(e),
+                           "done": i + 1, "total": total})
+                continue
+            await asyncio.sleep(0)
+
+        yield evt({"status": "done", "total": total})
+
     except Exception as e:
-        log_ingestion_error(filename, str(e))
-        print(f"❌ Ingestion failed for {filename}: {str(e)}")
+        yield evt({"status": "error", "message": str(e)})
+        yield evt({"status": "done"})
