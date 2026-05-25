@@ -54,7 +54,7 @@ python ingestion/ingest.py
 ```env
 OPENAI_API_KEY=sk-...                    # Required
 LLM_PROVIDER=openai                      # "openai" (default) or "ollama"
-OPENAI_MODEL=gpt-4.1-nano                # Model for LLM chat responses
+OPENAI_MODEL=gpt-5-mini                  # Model for LLM chat responses — can be reasoning
 LIGHTRAG_EXTRACT_MODEL=gpt-4.1-nano      # Model for LightRAG entity/relation extraction
                                          # Must be a NON-reasoning model — reasoning models
                                          # exhaust max_completion_tokens on LightRAG's 14 KB
@@ -180,6 +180,18 @@ Each chunk is inserted with a metadata header:
 
 ---
 
+## Model Usage
+
+Three distinct model roles — each configured independently:
+
+| Role | Model | Where | Notes |
+|---|---|---|---|
+| **Chat responses** | `gpt-5-mini` (`OPENAI_MODEL`) | `llm_service.py` | Can be any model incl. reasoning |
+| **Entity/relation extraction** | `gpt-4.1-nano` (`LIGHTRAG_EXTRACT_MODEL`) | `lightrag_service.py → gpt41_nano_complete()` | **Must be non-reasoning** — called only at document ingestion time |
+| **Embeddings** | `text-embedding-3-small` | `lightrag_service.py → openai_embed()` | Hardcoded; dim=1536; used at ingestion and at query time |
+
+**LightRAG search itself calls no LLM.** `only_need_context=True` makes LightRAG return raw chunks (graph + vector retrieval) without generating an answer. The LLM is only invoked separately via `ask_llm()` in the chat router.
+
 ## LLM Service (`app/services/llm_service.py`)
 
 - **OpenAI:** `temperature=1`, `max_completion_tokens=8000`, timeout=90s.
@@ -209,11 +221,23 @@ Navigation facts are **auto-generated** from `ServiceRegistry` (reads `services.
 
 ### Flow types
 
-| Intent | Class | Behavior |
-|---|---|---|
-| `tu_application` | `LinearFlow` | 5 steps; entity (ФЛ/ЮЛ) required before step 1; advances on "дальше"/"да" |
-| `real_estate` | `ScenarioFlow` | Branching (cadastre vs address register); stores `original_question` |
-| `None` | `FAQFlow` | Pure retrieval; no state tracking |
+| Intent | Class | Steps | Entity gate | Behavior |
+|---|---|---|---|---|
+| `tu_application` | `LinearFlow` | 5 | Yes | Entity (ФЛ/ЮЛ) required before step 1; advances on "дальше"/"да" |
+| `primary_connection_residential` | `LinearFlow` | 4 | No | Бытовое первичное подключение |
+| `primary_connection_nonresidential` | `LinearFlow` | 5 | No | Небытовое первичное подключение |
+| `secondary_connection` | `LinearFlow` | 3 | Yes | Вторичное подключение; ФЛ/ЮЛ form differs at step 1 |
+| `contract_termination` | `LinearFlow` | 3 | Yes | Расторжение договора; signing via ЭЦП or SMS |
+| `grid_disconnection` | `LinearFlow` | 2 | Yes | Отключение от электросетей |
+| `equipment_testing` | `LinearFlow` | 4 | Yes | Испытание/измерение электрооборудования; step 4 = поставщик selection |
+| `real_estate` | `ScenarioFlow` | — | No | Branching (cadastre vs address register); stores `original_question` |
+| `supply_contract_residential` | `FAQFlow` | — | No | Бытовой договор — pure retrieval |
+| `supply_contract_non_residential` | `FAQFlow` | — | No | Небытовой договор — pure retrieval |
+| `load_calculation` | `FAQFlow` | — | No | Расчёт нагрузки |
+| `draft_design` | `FAQFlow` | — | No | Эскизный проект |
+| `construction_works` | `FAQFlow` | — | No | СМР |
+| `meter_sealing` | `FAQFlow` | — | No | Установка/снятие пломбы |
+| `None` | `FAQFlow` | — | No | General FAQ; no state tracking |
 
 ### Session update modes
 
