@@ -8,6 +8,9 @@ _EXPECTED_SERVICES = {
     "tu_application", "real_estate",
     "supply_contract_residential", "supply_contract_non_residential",
     "load_calculation", "draft_design", "construction_works", "meter_sealing",
+    "primary_connection_residential", "primary_connection_nonresidential",
+    "secondary_connection", "contract_termination",
+    "grid_disconnection", "equipment_testing",
 }
 
 
@@ -30,7 +33,7 @@ class TestSingleton:
 # ===========================================================================
 
 class TestServiceLoading:
-    def test_all_eight_services_present(self):
+    def test_all_services_present(self):
         assert set(registry.list_services().keys()) == _EXPECTED_SERVICES
 
     def test_unknown_service_returns_none(self):
@@ -52,7 +55,13 @@ class TestServiceLoading:
         assert registry.get_service("real_estate").flow.requires_entity is False
 
     def test_all_faq_services_have_correct_type(self):
-        faq_services = _EXPECTED_SERVICES - {"tu_application", "real_estate"}
+        non_faq = {
+            "tu_application", "real_estate",
+            "primary_connection_residential", "primary_connection_nonresidential",
+            "secondary_connection", "contract_termination",
+            "grid_disconnection", "equipment_testing",
+        }
+        faq_services = _EXPECTED_SERVICES - non_faq
         for sid in faq_services:
             svc = registry.get_service(sid)
             assert svc.flow.type == "faq", f"{sid} must be faq"
@@ -152,6 +161,18 @@ class TestDetectIntentFilename:
     def test_load_calculation_nagruzk(self):
         assert registry.detect_intent("", "Расчёт электрической нагрузки.txt") == "load_calculation"
 
+    def test_secondary_connection_filename(self):
+        assert registry.detect_intent("", "Вторичное подключение.txt") == "secondary_connection"
+
+    def test_contract_termination_filename(self):
+        assert registry.detect_intent("", "Расторжение договора.txt") == "contract_termination"
+
+    def test_grid_disconnection_filename(self):
+        assert registry.detect_intent("", "Отключение от электросетей.txt") == "grid_disconnection"
+
+    def test_equipment_testing_filename(self):
+        assert registry.detect_intent("", "Испытание, измерение электрооборудования.txt") == "equipment_testing"
+
     def test_general_questions_no_match(self):
         assert registry.detect_intent("", "Общие вопросы.txt") is None
 
@@ -173,6 +194,18 @@ class TestDetectIntentContent:
 
     def test_content_meter_sealing(self):
         assert registry.detect_intent("пломбы на приборе учета", "") == "meter_sealing"
+
+    def test_content_secondary_connection(self):
+        assert registry.detect_intent("вторичное подключение к сети", "") == "secondary_connection"
+
+    def test_content_contract_termination(self):
+        assert registry.detect_intent("расторжение договора электроснабжения", "") == "contract_termination"
+
+    def test_content_grid_disconnection(self):
+        assert registry.detect_intent("отключение от электросетей", "") == "grid_disconnection"
+
+    def test_content_equipment_testing(self):
+        assert registry.detect_intent("испытание электрооборудования уровень напряжения", "") == "equipment_testing"
 
 
 # ===========================================================================
