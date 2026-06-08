@@ -54,22 +54,51 @@ class TestServiceLoading:
     def test_real_estate_does_not_require_entity(self):
         assert registry.get_service("real_estate").flow.requires_entity is False
 
-    def test_all_faq_services_have_correct_type(self):
-        non_faq = {
-            "tu_application", "real_estate",
-            "primary_connection_residential", "primary_connection_nonresidential",
-            "secondary_connection", "contract_termination",
-            "grid_disconnection", "equipment_testing",
-        }
-        faq_services = _EXPECTED_SERVICES - non_faq
-        for sid in faq_services:
+    def test_all_services_are_linear_or_scenario(self):
+        for sid in _EXPECTED_SERVICES:
             svc = registry.get_service(sid)
-            assert svc.flow.type == "faq", f"{sid} must be faq"
+            assert svc.flow.type in {"linear", "scenario"}, (
+                f"{sid} must be linear or scenario, got {svc.flow.type}"
+            )
+
+    def test_services_with_fl_ul_split_require_entity(self):
+        requires_entity_services = {
+            "tu_application", "secondary_connection", "contract_termination",
+            "grid_disconnection", "equipment_testing",
+            "load_calculation", "draft_design", "construction_works", "meter_sealing",
+        }
+        for sid in requires_entity_services:
+            svc = registry.get_service(sid)
+            assert svc.flow.requires_entity is True, f"{sid} must require entity"
+
+    def test_single_entity_services_do_not_require_entity(self):
+        no_entity_services = {
+            "supply_contract_residential", "supply_contract_non_residential",
+            "primary_connection_residential", "primary_connection_nonresidential",
+        }
+        for sid in no_entity_services:
+            svc = registry.get_service(sid)
+            assert svc.flow.requires_entity is False, f"{sid} must not require entity"
+
+    def test_converted_services_have_correct_max_steps(self):
+        expected = {
+            "supply_contract_residential": 4,
+            "supply_contract_non_residential": 4,
+            "load_calculation": 4,
+            "draft_design": 3,
+            "construction_works": 4,
+            "meter_sealing": 2,
+        }
+        for sid, steps in expected.items():
+            svc = registry.get_service(sid)
+            assert svc.flow.max_steps == steps, (
+                f"{sid} must have max_steps={steps}, got {svc.flow.max_steps}"
+            )
 
     def test_get_flow_type_helper(self):
         assert registry.get_flow_type("tu_application") == "linear"
         assert registry.get_flow_type("real_estate") == "scenario"
-        assert registry.get_flow_type("meter_sealing") == "faq"
+        assert registry.get_flow_type("meter_sealing") == "linear"
 
     def test_get_flow_type_unknown_returns_faq(self):
         assert registry.get_flow_type("does_not_exist") == "faq"

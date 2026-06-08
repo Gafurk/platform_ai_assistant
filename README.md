@@ -78,14 +78,18 @@ app/
 │   ├── chat.py               # POST /api/v1/chat
 │   └── documents.py          # upload / list / delete / reindex
 ├── services/
-│   ├── lightrag_service.py   # LightRAG init + search_docs()
+│   ├── lightrag_service.py   # LightRAG init + search_docs() core implementation
+│   ├── rag.py                # Thin wrapper — delegates to lightrag_service.search_docs()
 │   ├── llm_service.py        # OpenAI/Ollama call
 │   ├── prompt_builder.py     # Static base prompt + dynamic suffix (prefix caching)
 │   ├── rulebased.py          # SYSTEM_COMMANDS + NAVIGATION_RULES (zero LLM cost)
 │   ├── session.py            # SessionManager
+│   ├── translit.py           # Kazakh transliteration (Russian letters → KZ Cyrillic)
 │   ├── rate_limit.py         # Per-session rate limiter
 │   ├── task_queue.py         # Async ingestion queue (max 2 concurrent)
 │   └── validation.py         # Input validation
+└── utils/
+│   └── logger.py             # Structured logging (chat requests, RAG searches, errors)
 └── main.py                   # App entry point, StaticFiles mount
 
 config/
@@ -116,19 +120,21 @@ POST /api/v1/chat
   │    SYSTEM_COMMANDS: greetings, identity, handoff
   │    NAVIGATION_RULES: status/download queries (zero LLM tokens)
   │
-  ├─ language detect (Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і)
+  ├─ KZ transliteration (_safe_normalize_kz — Russian-letter Kazakh → KZ Cyrillic)
+  ├─ language detect (Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і; KZ entity abbrevs: ЖТ/ЗТ)
   ├─ intent classify (sticky → keyword switch → page fallback)
-  ├─ navigation FAQ shortcut   ──→ nav path answer, no LLM
+  ├─ navigation FAQ shortcut   ──→ search_docs(intent=None) + ask_llm, history-only update
   ├─ FAQ interruption gate     ──→ FAQFlow answer, flow state preserved
-  ├─ entity detect (ФЛ / ЮЛ from message + history)
-  ├─ entity clarification gate (blocks LinearFlow until entity known)
+  ├─ entity detect (ФЛ / ЮЛ from message + history; message-only for intent switch)
+  ├─ entity clarification gate (blocks LinearFlow until entity known; skipped for steps 2–5)
   ├─ flow.next_state()         ──→ LinearFlow / ScenarioFlow / FAQFlow
+  ├─ effective_step resolve    ──→ explicit шаг N > state.step > 1 (if intent, non-scenario) > None
   ├─ search_docs()             ──→ LightRAG hybrid + intent/step filter
   ├─ ask_llm()                 ──→ OpenAI with cached static prompt + dynamic suffix
   └─ session.update()          ──→ state + history (capped at 10 entries / 5 turns)
 
 Response: ChatResponse(answer, source, handoff)
-source values: "rule_based" | "faq_interruption" | "llm"
+source values: "rule_based" | "faq_interruption" | "llm" | "validation" | "rate_limit"
 ```
 
 ---
@@ -199,14 +205,14 @@ All definitions live in `config/services.yaml` + `config/keywords.yaml`. **Addin
 | `grid_disconnection` | Отключение от электросетей | Linear | 2 | Yes |
 | `equipment_testing` | Испытание, измерение электрооборудования | Linear | 4 | Yes |
 | `real_estate` | Добавление объекта недвижимости | Scenario | — | No |
-| `supply_contract_residential` | Договор электроснабжения (бытовой) | FAQ | — | No |
-| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | FAQ | — | No |
-| `load_calculation` | Расчёт электрической нагрузки | FAQ | — | No |
-| `draft_design` | Разработка эскизного проекта | FAQ | — | No |
-| `construction_works` | Строительно-монтажные работы | FAQ | — | No |
-| `meter_sealing` | Установка/снятие пломбы | FAQ | — | No |
+| `supply_contract_residential` | Договор электроснабжения (бытовой) | Linear | 4 | No |
+| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | Linear | 4 | No |
+| `load_calculation` | Расчёт электрической нагрузки | Linear | 4 | Yes |
+| `draft_design` | Разработка эскизного проекта | Linear | 3 | Yes |
+| `construction_works` | Строительно-монтажные работы | Linear | 4 | Yes |
+| `meter_sealing` | Установка/снятие пломбы | Linear | 2 | Yes |
 
-**Entity gate** — LinearFlow blocks at step 0 until user identifies as ФЛ (individual) or ЮЛ (legal entity). Step 1 form fields differ by entity type.
+**Entity gate** — LinearFlow blocks at step 0 until user identifies as ФЛ (individual) or ЮЛ (legal entity). Step 1 form fields differ by entity type. Steps 2–5 are shared and skip the gate.
 
 ---
 
@@ -249,7 +255,8 @@ Navigation facts are **auto-generated** from `ServiceRegistry`. Add new paths to
 1. **Situation blocks** — `Ситуация \d+` / `Жағдай \d+` / `Шаг \d+` → one LightRAG insert each.
 2. **Meta blocks** — `Цель интента` / `Мақсаты` / `Требования` → lower priority.
 3. **Deduplication** — keeps highest-quality version of duplicate situations.
-4. **Fallback** — 800-word fixed chunks (overlap=100) if no structured headers found.
+4. **Entity split** (`_split_by_entity`) — chunks containing both `Для ФЛ:` and `Для ЮЛ:` sections are split into separate sub-chunks so the LLM never receives both entity types at once.
+5. **Fallback** — 800-word fixed chunks (overlap=100) if no structured headers found.
 
 Each chunk gets a metadata header:
 ```
@@ -262,13 +269,13 @@ Each chunk gets a metadata header:
 
 ## LightRAG Search Pipeline
 
-`search_docs()` in `app/services/lightrag_service.py`:
+`search_docs()` in `app/services/lightrag_service.py` (exposed via `app/services/rag.py`):
 
 1. **Query enrichment** — prepend `[TITLE: Шаг N]`, `[INTENT: slug]`, `[entity]`.
 2. **Hybrid search** — graph traversal + vector similarity (`top_k=20`, `only_need_context=True`).
 3. **Intent filter** — keep only chunks whose `[INTENT:]` tag matches current intent.
 4. **Step filter** — if `current_step` is set, keep only chunks containing `Шаг N`; return `""` if none (triggers fallback).
-5. **Step fallback** — retry with `"Шаг N {query}"`, `top_k*2`, no metadata prefix.
+5. **Step fallback** — retry with bare `"Шаг N"`, `top_k*2`, no metadata prefix.
 
 Two separate OpenAI clients: `_oai_embeddings` (timeout 300s) and `_oai_llm` (timeout 600s). Kept separate because a shared short-timeout client would abort slow entity extractions mid-run.
 

@@ -120,8 +120,9 @@ def split_by_situations(text: str, filename: str) -> list[dict]:
             content = situation_blocks[i + 1].strip() if i + 1 < len(situation_blocks) else ""
 
             if content:
+                is_step_block = bool(re.match(r'Шаг\s+\d+', situation_title))
                 has_page_marker = bool(re.search(r'(?:Страница|Бет)\s*[-–]|Контекст страницы:', content))
-                if not has_page_marker and len(content) < 200:
+                if not is_step_block and not has_page_marker and len(content) < 200:
                     i += 2
                     continue
                 content_clean = re.sub(r'Шаблон ответа:?\s*|Жауап үлгісі:?\s*|Ответ бота:\s*', '', content).strip()
@@ -224,6 +225,44 @@ def split_by_chunks(text: str, chunk_size: int = 800, overlap: int = 100) -> lis
     return chunks
 
 
+_ENTITY_MARKERS = re.compile(
+    r'(Для физического лица\s*:?|Для юридического лица\s*:?|Для ФЛ\s*:?|Для ЮЛ\s*:?)',
+    re.IGNORECASE,
+)
+
+
+def _split_by_entity(chunk: dict) -> list[dict]:
+    """Split a step chunk into separate ФЛ/ЮЛ sub-chunks if both sections exist.
+
+    Documents often contain both entity sections in one step:
+        Шаг 1. "Данные заявителя"
+        Для физического лица: ...
+        Для юридического лица: ...
+
+    This causes the LLM to reproduce both sections even when entity is known.
+    Splitting ensures each chunk contains only one entity type.
+    """
+    parts = _ENTITY_MARKERS.split(chunk["text"])
+
+    if len(parts) <= 1:
+        return [chunk]
+
+    result = []
+    i = 1
+    while i < len(parts) - 1:
+        marker = parts[i].strip()
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        if content and len(content) > 50:
+            is_fl = "физическ" in marker.lower() or marker.upper().endswith("ФЛ:")
+            entity_tag = "ФЛ" if is_fl else "ЮЛ"
+            result.append({
+                **chunk,
+                "title": f"{chunk['title']} ({entity_tag})",
+                "text": f"{chunk['title']}\n\n{marker}\n\n{content}",
+            })
+        i += 2
+
+    return result if result else [chunk]
 
 
 async def ingest_file(filepath: str, filename: str):
@@ -249,6 +288,15 @@ async def ingest_file(filepath: str, filename: str):
     intent_name_raw = _extract_intent_name(text)
     intent_slug, intent_name = _slug_intent(intent_name_raw, filename)
     chunks = split_by_situations(text, filename)
+
+    # Expand chunks that contain both ФЛ and ЮЛ sections into separate chunks.
+    # Prevents LLM from reproducing both entity sections when only one is relevant.
+    expanded = []
+    for chunk in chunks:
+        expanded.extend(_split_by_entity(chunk))
+    if len(expanded) > len(chunks):
+        print(f"🔀 Entity split: {len(chunks)} → {len(expanded)} chunks")
+    chunks = expanded
 
     if not chunks:
         print(f"ℹ️  No semantic blocks found, using fixed-size chunking.")
