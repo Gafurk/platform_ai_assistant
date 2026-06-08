@@ -339,6 +339,33 @@ class TestGetFlow:
 # Invalid transitions
 # ===========================================================================
 
+class TestLinearFlowNoEntityRequired:
+    """Services where requires_entity=false must start step without entity."""
+    flow = LinearFlow()
+
+    def test_step_starts_without_entity_for_no_entity_service(self):
+        # supply_contract_residential has requires_entity=false → step starts immediately
+        state = FlowState(intent="supply_contract_residential", entity=None, step=None)
+        new = self.flow.next_state(ctx("подать заявку", state=state))
+        assert new.step == 1
+
+    def test_step_advances_without_entity_for_no_entity_service(self):
+        state = FlowState(intent="supply_contract_residential", entity=None, step=1)
+        new = self.flow.next_state(ctx("далее", state=state))
+        assert new.step == 2
+
+    def test_step_capped_at_service_max_steps(self):
+        # meter_sealing has max_steps=2 — must not advance past 2
+        state = FlowState(intent="meter_sealing", entity="физическое лицо", step=2)
+        new = self.flow.next_state(ctx("далее", state=state))
+        assert new.step == 2
+
+    def test_draft_design_capped_at_3(self):
+        state = FlowState(intent="draft_design", entity="физическое лицо", step=3)
+        new = self.flow.next_state(ctx("далее", state=state))
+        assert new.step == 3
+
+
 class TestInvalidTransitions:
     flow = LinearFlow()
 

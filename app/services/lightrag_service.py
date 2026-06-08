@@ -172,7 +172,24 @@ async def reinitialize():
     """Wipe data/lightrag/ and create a fresh LightRAG instance. Called by /reindex."""
     global rag
     import shutil
-    shutil.rmtree("./data/lightrag", ignore_errors=True)
+
+    lightrag_dir = "./data/lightrag"
+
+    # Close the current rag instance to release any open file handles before wiping.
+    # On Windows, rmtree silently fails (ignore_errors=True) when files are held open
+    # by a concurrent search, leaving the old kv_store_doc_status.json intact.
+    # initialize_storages() would then load stale "failed" entries, causing LightRAG
+    # to treat fresh inserts as duplicates and skip all entity extraction.
+    try:
+        await rag.finalize_storages()
+    except Exception:
+        pass
+
+    try:
+        shutil.rmtree(lightrag_dir)
+    except Exception as e:
+        raise RuntimeError(f"Failed to wipe {lightrag_dir}: {e}") from e
+
     rag = _create_rag()
     await rag.initialize_storages()
     print("✅ LightRAG reinitialized (fresh)")
@@ -262,10 +279,15 @@ async def search_docs(
         #
         # Why clean query? The "[TITLE: Шаг N] [INTENT:]" prefix causes LightRAG's
         # entity extractor to anchor on "Шаг 1" (most-connected entity) for all steps.
-        # A plain "Шаг N <query>" lets the extractor find the right step cleanly.
+        # Entity is intentionally excluded here: shared steps (2-N) have no FL/UL-specific
+        # text, so including "физическое лицо" in the query causes LightRAG to rank
+        # entity-connected chunks from other services (TU_application dominates the graph)
+        # above the correct step chunk. A bare "Шаг N" query lets the extractor find the
+        # step entity → graph traversal returns all Шаг-N chunks → intent filter keeps only
+        # the correct service's chunk.
         # Why top_k * 2? The correct step chunk may rank 21+ and be cut off at top_k=20.
         if current_step is not None and filtered_chunk_count == 0:
-            fallback_query = f"Шаг {current_step} {query}"
+            fallback_query = f"Шаг {current_step}"
             fallback_result = await rag.aquery(
                 fallback_query,
                 param=QueryParam(mode="hybrid", only_need_context=True, top_k=top_k * 2),
