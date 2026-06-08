@@ -7,6 +7,20 @@ import re
 from typing import Optional
 import pytest
 
+# ---------------------------------------------------------------------------
+# Inline copy of _contains_progression_word (mirrors chat.py logic)
+# ---------------------------------------------------------------------------
+
+_PROGRESSION_TOKENS = frozenset({
+    "дальше", "далее", "следующий", "продолжай", "продолжи", "давай", "да",
+    "келесі", "жалғастыр",
+})
+
+
+def _contains_progression_word(message: str) -> bool:
+    words = set(re.sub(r"[?!.,]", "", message.strip().lower()).split())
+    return bool(words & _PROGRESSION_TOKENS)
+
 
 # ---------------------------------------------------------------------------
 # Inline copy of _detect_entity_from_message_only (mirrors chat.py logic)
@@ -194,3 +208,106 @@ class TestDetectEntityFromMessageOnly:
     def test_fl_wins_over_ul_when_fl_first(self):
         # FL phrase appears before UL phrase → FL returned
         assert _detect_entity_from_message_only("физ лицо или юр лицо") == "физическое лицо"
+
+
+# ===========================================================================
+# FAQ interruption pre-lock guard — _msg_has_entity sentinel
+#
+# The gate in chat.py uses `_detect_entity_from_message_only` to prevent
+# routing entity responses (e.g. "я фл") through FAQ before the flow locks.
+# These tests verify that the sentinel is True exactly when an entity phrase
+# is present, so the entity gate still fires for those messages.
+# ===========================================================================
+
+class TestFaqInterruptionPreLockGuard:
+    """Verify that messages carrying entity phrases are NOT routed to FAQ."""
+
+    # These messages must NOT trigger FAQ interruption pre-lock
+    # (i.e. _detect_entity_from_message_only returns non-None)
+    def test_entity_response_fl_exact(self):
+        assert _detect_entity_from_message_only("фл") is not None
+
+    def test_entity_response_ul_exact(self):
+        assert _detect_entity_from_message_only("юл") is not None
+
+    def test_entity_response_fl_sentence(self):
+        assert _detect_entity_from_message_only("я физическое лицо") is not None
+
+    def test_entity_response_ul_sentence(self):
+        assert _detect_entity_from_message_only("подаю как юридическое лицо") is not None
+
+    def test_entity_response_kz_fl(self):
+        assert _detect_entity_from_message_only("жт") is not None
+
+    def test_entity_response_kz_ul(self):
+        assert _detect_entity_from_message_only("зт") is not None
+
+    # These messages MUST be routed to FAQ pre-lock
+    # (i.e. _detect_entity_from_message_only returns None → FAQ interruption allowed)
+    def test_offtopic_phase_question(self):
+        assert _detect_entity_from_message_only("что такое фаза?") is None
+
+    def test_offtopic_sms_question(self):
+        assert _detect_entity_from_message_only("не пришел смс код") is None
+
+    def test_offtopic_meter_question(self):
+        assert _detect_entity_from_message_only("что такое счётчик?") is None
+
+    def test_offtopic_generic_question(self):
+        assert _detect_entity_from_message_only("как работает система?") is None
+
+    def test_step_number_no_entity(self):
+        # "шаг 3" has no entity phrase — but step check fires before entity check
+        assert _detect_entity_from_message_only("шаг 3") is None
+
+    def test_step_next_no_entity(self):
+        assert _detect_entity_from_message_only("далее") is None
+
+
+# ===========================================================================
+# _contains_progression_word
+#
+# Prevents FAQ interruption from hijacking continuation messages like
+# "Что делать дальше?" that contain a progression word but aren't exact
+# phrase matches caught by is_step_progression().
+# ===========================================================================
+
+class TestContainsProgressionWord:
+    # Should return True — message contains a progression token
+    def test_chto_delat_dalshe(self):
+        assert _contains_progression_word("Что делать дальше") is True
+
+    def test_chto_dalshe(self):
+        assert _contains_progression_word("Что дальше?") is True
+
+    def test_ok_dalee(self):
+        assert _contains_progression_word("Ок, далее") is True
+
+    def test_davay_dalshe(self):
+        assert _contains_progression_word("Давай дальше") is True
+
+    def test_standalone_dalshe(self):
+        assert _contains_progression_word("дальше") is True
+
+    def test_standalone_da(self):
+        assert _contains_progression_word("да") is True
+
+    def test_da_ponyatno(self):
+        assert _contains_progression_word("да, понятно") is True
+
+    def test_kz_kelesi(self):
+        assert _contains_progression_word("келесі") is True
+
+    # Should return False — no progression token
+    def test_offtopic_phase(self):
+        assert _contains_progression_word("что такое фаза?") is False
+
+    def test_entity_response(self):
+        assert _contains_progression_word("я физическое лицо") is False
+
+    def test_step_reference_only(self):
+        # step number checked separately in the gate — no progression word here
+        assert _contains_progression_word("Что делать на 3 шагу?") is False
+
+    def test_empty(self):
+        assert _contains_progression_word("") is False

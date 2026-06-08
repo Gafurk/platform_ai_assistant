@@ -71,6 +71,9 @@ OLLAMA_MODEL=llama3.2                    # Fallback only
 |---|---|
 | `app/routers/` | FastAPI route handlers (`chat.py`, `documents.py`) |
 | `app/services/` | Business logic: LightRAG, LLM, session, rule-based, rate limit |
+| `app/services/rag.py` | Thin wrapper — delegates `search_docs()` to `lightrag_service` |
+| `app/services/translit.py` | Kazakh transliteration — Russian-letter Kazakh → proper KZ Cyrillic |
+| `app/utils/logger.py` | Structured logging (chat requests, RAG searches, errors) |
 | `app/flows/` | Intent-based state machines (`linear.py`, `scenario.py`, `faq.py`) |
 | `app/config/` | `ServiceRegistry` singleton — loads YAML configs once at import |
 | `config/` | `services.yaml` (services + nav paths), `keywords.yaml` (intent keywords) |
@@ -90,21 +93,39 @@ POST /api/v1/chat
   ├─ validate (ChatRequest)
   ├─ rate_limit (per session_id)
   ├─ rule_based → SYSTEM_COMMANDS / NAVIGATION_RULES   ← returns immediately if matched
-  ├─ language detect (_detect_language — Kazakh Cyrillic: ә ғ қ ң ө ұ ү і)
+  ├─ session load (history + state)
+  ├─ KZ transliteration (_safe_normalize_kz)
+  │    — Russian-letter Kazakh → proper KZ Cyrillic
+  │    — guards against corrupting Russian messages
+  ├─ language detect (_detect_language)
+  │    — Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і
+  │    — KZ entity abbreviations: ЖТ/ЗТ (no KZ chars but KZ-only)
+  │    — short answers inherit language from history
   ├─ intent classify (sticky + keyword switch + page fallback)
-  ├─ navigation FAQ shortcut (status/download queries → nav path, no LLM)
-  ├─ FAQ interruption gate (locked flow + no flow keywords → FAQFlow, preserve state)
-  ├─ entity detect (ФЛ/ЮЛ from message + history)
-  ├─ entity clarification gate (TU application blocks until entity known)
+  ├─ navigation FAQ shortcut (_is_navigation_query)
+  │    — intercepts status/download/find queries
+  │    — search_docs(intent=None) + ask_llm; update_history_only preserves flow state
+  ├─ FAQ interruption gate (locked flow + no flow keywords + no step ref + no entity phrase)
+  │    — answers side question without disturbing active flow state
+  ├─ intent update (only when not locked, or explicit keyword switch)
+  ├─ entity detect
+  │    — message-only: always overrides existing value (allows mid-session correction)
+  │    — message+history: scan history for continuity, only when intent didn't just switch
+  ├─ entity clarification gate
+  │    — blocks services with requires_entity=true until ФЛ/ЮЛ is known
+  │    — skipped for steps 2–5 (_SHARED_STEPS) — fields identical for both entity types
   ├─ flow.next_state() (LinearFlow / ScenarioFlow / FAQFlow)
   ├─ flow lock (state.locked=True once step≥1 or situation chosen)
+  ├─ effective_step resolve
+  │    — explicit "шаг N" in message > state.step > 1 (if intent set, non-scenario) > None
+  │    — defaulting to 1 ensures FAQ services retrieve step-1 content on first query
   ├─ search_docs() — LightRAG hybrid + intent/step filter + step fallback
   ├─ ask_llm() — OpenAI with static cached prompt + dynamic suffix
   └─ session.update() (state + history)
 ```
 
 **Response:** `ChatResponse(answer, source, handoff)`  
-`source` values: `"rule_based"` | `"faq_interruption"` | `"llm"`
+`source` values: `"rule_based"` | `"faq_interruption"` | `"llm"` | `"validation"` | `"rate_limit"`
 
 ---
 
@@ -118,6 +139,7 @@ POST /api/v1/upload
   → TaskQueue.submit(_run_ingestion)   ← max 2 concurrent
   → ingest_file() [async]
     → split_by_situations() — situation blocks → meta blocks → 800-word fallback chunks
+    → _split_by_entity() — chunks with both ФЛ + ЮЛ sections split into sub-chunks
     → rag.ainsert(chunk) × N   ← adds to KG, never wipes
 ```
 
@@ -129,8 +151,9 @@ The `/reindex` endpoint performs a complete rebuild and streams progress via **S
 
 ```
 POST /api/v1/reindex
+  → rag.finalize_storages()     ← release file handles (Windows: prevents rmtree failure)
   → wipe data/lightrag/ directory entirely
-  → reinitialize LightRAG (lightrag_service.initialize())
+  → reinitialize LightRAG (lightrag_service.reinitialize())
   → for each file in data/docs/:
       → ingest_file(filepath)         ← try/except per file so one failure doesn't stop all
       → yield SSE: {"status": "progress", "file": name, "done": N, "total": M}
@@ -153,7 +176,8 @@ data: {"status": "done"}\n\n          ← always sent, even on error
 1. **Situation blocks** (`Ситуация \d+`, `Жағдай \d+`, `Шаг \d+`) — each block is one LightRAG insert.
 2. **Meta blocks** (`Цель интента`, `Мақсаты`, `Требования`) — lower priority.
 3. **Deduplication** — keeps highest-quality version of duplicate situations.
-4. **Fallback** — 800-word fixed chunks (overlap=100) if no headers found.
+4. **Entity split** (`_split_by_entity`) — chunks containing both `Для ФЛ:` and `Для ЮЛ:` sections are split into separate sub-chunks. Prevents LLM from reproducing both entity types when only one is relevant.
+5. **Fallback** — 800-word fixed chunks (overlap=100) if no headers found.
 
 Each chunk is inserted with a metadata header:
 ```
@@ -165,18 +189,21 @@ Each chunk is inserted with a metadata header:
 
 ## LightRAG Search Pipeline
 
-`search_docs()` in `app/services/lightrag_service.py`:
+`search_docs()` in `app/services/lightrag_service.py` — exposed via `app/services/rag.py`:
 
 1. **Query enrichment** — prepend `[TITLE: Шаг N]`, `[INTENT: slug]`, `[entity]` to query.
 2. **Hybrid search** — graph traversal + vector similarity (`only_need_context=True`, `top_k=20`).
 3. **Intent filter** (`_filter_context_by_intent`) — keep only chunks whose `[INTENT:]` tag matches.
 4. **Step filter** — if `current_step` set, further keep only chunks containing `Шаг N`; return `""` if none (triggers fallback).
-5. **Step fallback** — if `filtered_chunk_count == 0`: retry with plain `"Шаг N {query}"`, `top_k*2`, no metadata prefix.
+5. **Step fallback** — if `filtered_chunk_count == 0`: retry with bare `"Шаг N"`, `top_k*2`, no metadata prefix.
 
 `rerank_model_func=None` — reranking disabled (no reranker available).
 
 **Why two OpenAI clients in `lightrag_service.py`?**  
 `_oai_embeddings` (timeout=300s) and `_oai_llm` (timeout=600s) are separate because LightRAG's entity extraction can be slow on large documents; a shared short-timeout client would abort extractions mid-run.
+
+**Why `finalize_storages()` before reindex wipe?**  
+On Windows, `shutil.rmtree` silently fails when files are held open. Without finalize, stale `kv_store_doc_status.json` entries survive, causing LightRAG to treat fresh inserts as duplicates and skip all entity extraction.
 
 ---
 
@@ -231,13 +258,20 @@ Navigation facts are **auto-generated** from `ServiceRegistry` (reads `services.
 | `grid_disconnection` | `LinearFlow` | 2 | Yes | Отключение от электросетей |
 | `equipment_testing` | `LinearFlow` | 4 | Yes | Испытание/измерение электрооборудования; step 4 = поставщик selection |
 | `real_estate` | `ScenarioFlow` | — | No | Branching (cadastre vs address register); stores `original_question` |
-| `supply_contract_residential` | `FAQFlow` | — | No | Бытовой договор — pure retrieval |
-| `supply_contract_non_residential` | `FAQFlow` | — | No | Небытовой договор — pure retrieval |
-| `load_calculation` | `FAQFlow` | — | No | Расчёт нагрузки |
-| `draft_design` | `FAQFlow` | — | No | Эскизный проект |
-| `construction_works` | `FAQFlow` | — | No | СМР |
-| `meter_sealing` | `FAQFlow` | — | No | Установка/снятие пломбы |
+| `supply_contract_residential` | `LinearFlow` | 4 | No | Бытовой договор |
+| `supply_contract_non_residential` | `LinearFlow` | 4 | No | Небытовой договор |
+| `load_calculation` | `LinearFlow` | 4 | Yes | Расчёт нагрузки |
+| `draft_design` | `LinearFlow` | 3 | Yes | Эскизный проект |
+| `construction_works` | `LinearFlow` | 4 | Yes | СМР |
+| `meter_sealing` | `LinearFlow` | 2 | Yes | Установка/снятие пломбы |
 | `None` | `FAQFlow` | — | No | General FAQ; no state tracking |
+
+### Entity gate details
+
+- Gate fires only for services with `requires_entity: true` in `services.yaml`.
+- **Skipped for steps 2–5** (`_SHARED_STEPS` in `chat.py`) — form fields are identical for ФЛ and ЮЛ from step 2 onward.
+- Mid-session corrections (`"я юр лицо"`) override the stored entity at any point.
+- KZ entity abbreviations `ЖТ/ЗТ` are recognized (no KZ-specific chars but exclusively KZ-context).
 
 ### Session update modes
 
@@ -245,7 +279,7 @@ Navigation facts are **auto-generated** from `ServiceRegistry` (reads `services.
 |---|---|---|
 | `update()` | Normal LLM turn | State + history |
 | `update_state_only()` | Clarification gate (no bot answer yet) | State only |
-| `update_history_only()` | FAQ interruption (flow active) | History only — flow state preserved |
+| `update_history_only()` | Navigation shortcut or FAQ interruption | History only — flow state preserved |
 
 History capped at 10 entries (5 turns).
 
@@ -264,6 +298,19 @@ Two dicts checked **before** any RAG or LLM call:
 
 ---
 
+## Kazakh Transliteration (`services/translit.py`)
+
+`_safe_normalize_kz()` in `chat.py` wraps `normalize_kz()`:
+
+1. Message already has KZ chars → `normalize_kz()` (normalize mixed input from KZ keyboard).
+2. Contains Russian function words → return unchanged (prevent Russian text corruption).
+3. No KZ chars, no Russian markers → try `normalize_kz()`; accept only if KZ chars appear in result.
+4. Otherwise → return original.
+
+This runs **after** the rule-based check and **before** language detection so the language detector and intent classifier always receive proper KZ Cyrillic.
+
+---
+
 ## Adding New Navigation Rules
 
 1. Add answer string to `NAVIGATION_RULES` in `rulebased.py`.
@@ -275,7 +322,7 @@ Two dicts checked **before** any RAG or LLM call:
 
 1. Create `app/flows/myflow.py` inheriting `BaseFlow`.
 2. Override `next_state()`, `build_query()`, optionally `is_step_progression()`.
-3. Register in `app/flows/registry.py` `_FLOWS` dict.
+3. Register in `app/flows/registry.py` `_flow_classes` dict.
 4. Add intent keywords to `INTENT_KEYWORDS` in `registry.py`.
 5. Add tests in `tests/test_flows.py`.
 
@@ -342,6 +389,7 @@ source.onerror = () => {
 - `DELETE /api/v1/documents/{filename}` removes the file only — KG nodes remain until full reindex.
 - `LIGHTRAG_EXTRACT_MODEL` **must** be a non-reasoning model. Reasoning models exhaust `max_completion_tokens` on LightRAG's 14 KB extraction prompt before writing any output → 0 entities extracted.
 - Do not add navigation paths to `app/flows/` — flows handle state transitions only.
+- Call `rag.finalize_storages()` before wiping `data/lightrag/` on Windows — otherwise open file handles cause `rmtree` to silently fail, leaving stale state that makes LightRAG skip entity extraction on fresh inserts.
 
 ---
 

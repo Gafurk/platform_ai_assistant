@@ -1,13 +1,49 @@
-services:
-  # LightRAG backend services are no longer needed as external services
-  # LightRAG uses:
-  # - Local nano-vectordb (embedded, no external service)
-  # - Local NetworkX graph store (embedded, no external service)
-  # - OpenAI API (gpt-4.1-nano for LLM, text-embedding-3-small for embeddings)
+# iSEL AI Assistant — Docker Compose
+#
+# All dependencies are embedded (no external services required):
+#   - Graph store:  NetworkX, persisted to ./data/lightrag/
+#   - Vector DB:    nano-vectordb, persisted to ./data/lightrag/
+#   - LLM/Embed:    OpenAI API (OPENAI_API_KEY required)
+#
+# Prerequisites:
+#   - Add a Dockerfile to the project root (see Quick Start in README.md)
+#   - Create a .env file with at least OPENAI_API_KEY
+#   - Place source documents in ./data/docs/ before running ingestion
+#
+# Usage:
+#   docker compose up --build          # start
+#   docker compose exec app python ingestion/ingest.py   # ingest docs
+#   docker compose down                # stop
 
-  # To run the application:
-  # 1. pip install lightrag-hku openai
-  # 2. Set OPENAI_API_KEY in .env
-  # 3. Run: uvicorn app.main:app --reload --port 8001
+services:
+  app:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      # Defaults — override in .env
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      LIGHTRAG_EXTRACT_MODEL: ${LIGHTRAG_EXTRACT_MODEL:-gpt-4.1-nano}
+    volumes:
+      # Persistent knowledge graph + vector index — back this up before any wipe
+      - ./data/lightrag:/app/data/lightrag
+      # Document staging area — add source files here before ingestion
+      - ./data/docs:/app/data/docs
+      # Static frontend — mounted read-only; rebuild image to update UI
+      - ./frontend:/app/frontend:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
+  # Named volumes as an alternative to bind mounts above.
+  # Uncomment and replace the bind-mount entries if you prefer Docker-managed storage.
+  # lightrag_data:
+  # docs_data:
