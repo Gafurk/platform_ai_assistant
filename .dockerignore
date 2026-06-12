@@ -1,0 +1,39 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Local data, storage & logs (persisted via volumes, not baked into image)
+data/
+logs/
+*.db
+*.log
+
+# Secrets / local config
+.env
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Tests & dev tooling
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Version control & IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+.ai-activity/
+
+# Misc
+*.zip
