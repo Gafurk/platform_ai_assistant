@@ -97,13 +97,15 @@ app/
 │   ├── chat.py               # POST /api/v1/chat
 │   └── documents.py          # upload / list / delete / reindex
 ├── services/
-│   ├── lightrag_service.py   # LightRAG init + search_docs()
+│   ├── lightrag_service.py   # LightRAG init + search_docs() implementation + ingestion insert
+│   ├── rag.py                # Thin wrapper re-exporting search_docs() (imported by chat router)
 │   ├── llm_service.py        # OpenAI/Ollama call
 │   ├── prompt_builder.py     # Static base prompt + dynamic suffix (prefix caching)
-│   ├── rulebased.py          # SYSTEM_COMMANDS + NAVIGATION_RULES (zero LLM cost)
-│   ├── session.py            # SessionManager
-│   ├── rate_limit.py         # Per-session rate limiter
-│   ├── task_queue.py         # Async ingestion queue (max 2 concurrent)
+│   ├── rulebased.py          # NAVIGATION_RULES + identity/operator/greeting (zero LLM cost)
+│   ├── translit.py           # Kazakh-in-Russian-letters → Cyrillic normalization (normalize_kz)
+│   ├── session.py            # SessionManager (history capped at 10 entries / 5 turns)
+│   ├── rate_limit.py         # Per-session rate limiter (10 requests / 60s)
+│   ├── task_queue.py         # Concurrency-limited queue — DEFINED but not currently wired up
 │   └── validation.py         # Input validation
 └── main.py                   # App entry point, StaticFiles mount
 
@@ -119,7 +121,7 @@ data/
 └── lightrag/                 # Persistent KG — back this up before any wipe (gitignored)
 
 frontend/                     # Static UI (glassmorphism widget)
-tests/                        # pytest suite, 200+ tests, ~95% pass rate
+tests/                        # pytest suite, 300+ tests
 
 Dockerfile                    # Multi-stage build (python:3.11-slim, non-root user)
 docker-compose.yml            # Single `api` service; mounts ./data + ./logs
@@ -141,19 +143,25 @@ POST /api/v1/chat
   │    SYSTEM_COMMANDS: greetings, identity, handoff
   │    NAVIGATION_RULES: status/download queries (zero LLM tokens)
   │
+  ├─ normalize Kazakh translit (normalize_kz: cyrillic-letter Kazakh → ә ғ қ …)
   ├─ language detect (Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і)
-  ├─ intent classify (sticky → keyword switch → page fallback)
-  ├─ navigation FAQ shortcut   ──→ nav path answer, no LLM
+  ├─ intent classify (keyword switch → sticky → page fallback)
+  ├─ navigation FAQ shortcut   ──→ LightRAG + LLM answer (uses the LLM); state preserved
   ├─ FAQ interruption gate     ──→ FAQFlow answer, flow state preserved
   ├─ entity detect (ФЛ / ЮЛ from message + history)
   ├─ entity clarification gate (blocks LinearFlow until entity known)
   ├─ flow.next_state()         ──→ LinearFlow / ScenarioFlow / FAQFlow
-  ├─ search_docs()             ──→ LightRAG hybrid + intent/step filter
+  ├─ flow lock                 ──→ TU (entity+step set) or Real Estate (situation chosen)
+  ├─ search_docs()             ──→ LightRAG hybrid + intent/step filter (via rag.py wrapper)
   ├─ ask_llm()                 ──→ OpenAI with cached static prompt + dynamic suffix
   └─ session.update()          ──→ state + history (capped at 10 entries / 5 turns)
 
 Response: ChatResponse(answer, source, handoff)
-source values: "rule_based" | "faq_interruption" | "llm"
+source values: "validation" | "rate_limit" | "rule_based" | "llm"
+  ("faq_interruption" is a log label only — the navigation shortcut and FAQ
+   interruption both return source "llm".)
+handoff: currently always false — the rule-based layer computes an operator/handoff
+  signal, but the chat router does not propagate it into the response.
 ```
 
 ---
@@ -187,7 +195,7 @@ source values: "rule_based" | "faq_interruption" | "llm"
 
 ### `POST /api/v1/upload`
 
-Multipart file upload. Saves to `data/docs/`, queues async ingestion (max 2 concurrent).  
+Multipart file upload. **Saves the file to `data/docs/` only — it does not index.** Building/updating the knowledge graph happens separately via `POST /api/v1/reindex` (or `python ingestion/ingest.py`). Returns `{"status": "saved", "filename": "<uuid>_<original>"}`.  
 Supported formats: `.pdf` `.txt` `.md` `.docx`
 
 ### `GET /api/v1/documents`
@@ -200,13 +208,18 @@ Removes the file from disk. **Does not** remove KG nodes — those persist until
 
 ### `POST /api/v1/reindex`
 
-Full wipe of `data/lightrag/` + rebuild from all files in `data/docs/`. Progress streamed via SSE:
+Full wipe of `data/lightrag/` (via `lightrag_service.reinitialize()`) + rebuild from all files in `data/docs/`. Each file is ingested in its own `try/except`, so one bad file doesn't abort the run. Progress is streamed as SSE (`text/event-stream`):
 
 ```
-data: {"status": "progress", "file": "foo.pdf", "done": 1, "total": 5}
-data: {"status": "ping"}      ← heartbeat every ~15s
-data: {"status": "done"}      ← always sent, even on partial failure
+data: {"status": "wiping"}
+data: {"status": "init"}
+data: {"status": "progress", "file": "foo.pdf", "done": 0, "total": 5}   ← done is 0-based index
+data: {"status": "file_error", "file": "bad.pdf", "error": "...", "done": 2, "total": 5}
+data: {"status": "done", "total": 5}                                     ← always reached on success
+data: {"status": "error", "message": "..."}                             ← top-level failure, then a final "done"
 ```
+
+> There is **no** `ping`/heartbeat event in the current implementation. The browser reads the stream via `fetch()` + a `ReadableStream` reader (not `EventSource`) and re-enables the UI in a `finally` block.
 
 ---
 
@@ -224,12 +237,12 @@ All definitions live in `config/services.yaml` + `config/keywords.yaml`. **Addin
 | `grid_disconnection` | Отключение от электросетей | Linear | 2 | Yes |
 | `equipment_testing` | Испытание, измерение электрооборудования | Linear | 4 | Yes |
 | `real_estate` | Добавление объекта недвижимости | Scenario | — | No |
-| `supply_contract_residential` | Договор электроснабжения (бытовой) | FAQ | — | No |
-| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | FAQ | — | No |
-| `load_calculation` | Расчёт электрической нагрузки | FAQ | — | No |
-| `draft_design` | Разработка эскизного проекта | FAQ | — | No |
-| `construction_works` | Строительно-монтажные работы | FAQ | — | No |
-| `meter_sealing` | Установка/снятие пломбы | FAQ | — | No |
+| `supply_contract_residential` | Договор электроснабжения (бытовой) | Linear | — | No |
+| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | Linear | — | No |
+| `load_calculation` | Расчёт электрической нагрузки | Linear | — | No |
+| `draft_design` | Разработка эскизного проекта | Linear | — | No |
+| `construction_works` | Строительно-монтажные работы | Linear | — | No |
+| `meter_sealing` | Установка/снятие пломбы | Linear | — | No |
 
 **Entity gate** — LinearFlow blocks at step 0 until user identifies as ФЛ (individual) or ЮЛ (legal entity). Step 1 form fields differ by entity type.
 
