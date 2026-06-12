@@ -6,7 +6,9 @@ from typing import Optional
 from fastapi import APIRouter
 
 from app.flows.base import FlowContext
+from app.config.service_registry import ServiceRegistry
 from app.flows.faq import FAQFlow
+from app.flows.linear import LinearFlow
 from app.flows.registry import classify_intent, get_flow, has_flow_keywords
 from app.flows.scenario import ScenarioFlow
 from app.models.schemas import ChatRequest, ChatResponse, FlowState
@@ -20,6 +22,7 @@ from app.services.validation import ValidationError, validate_message, validate_
 from app.utils.logger import log_chat_request
 
 router = APIRouter()
+_registry = ServiceRegistry()
 
 # ---------------------------------------------------------------------------
 # Constants — entity detection
@@ -174,11 +177,12 @@ def _needs_entity_clarification(
 ) -> bool:
     if entity is not None:
         return False
-    # Only TU application branches on entity type (ФЛ/ЮЛ have different forms).
-    # Real estate object addition is identical for all user types.
-    if intent != "tu_application":
+    if intent is None:
         return False
-    # Shared steps (2–5) work the same for both entity types — skip gate
+    svc = _registry.get_service(intent)
+    if svc is None or not svc.flow.requires_entity:
+        return False
+    # Shared steps (2–5) have identical fields for both entity types — skip gate.
     if page and any(step in page.lower() for step in _SHARED_STEPS):
         return False
     return True
@@ -200,6 +204,24 @@ def _annotate_question(message: str, entity: Optional[str], lang: str) -> str:
         else f"[пользователь уже указал: {entity}]"
     )
     return f"{message} {ann}"
+
+
+_PROGRESSION_TOKENS = frozenset({
+    "дальше", "далее", "следующий", "продолжай", "продолжи", "давай", "да",
+    "келесі", "жалғастыр",
+})
+
+
+def _contains_progression_word(message: str) -> bool:
+    """True when message contains a step-progression word as a standalone token.
+
+    Catches phrases like "Что делать дальше?" or "Ок, давай" that should
+    continue the flow but don't match the exact-phrase check in is_step_progression().
+    Multi-word progression phrases ("ары қарай", "следующий шаг") are intentionally
+    excluded — they're caught by is_step_progression() via exact match already.
+    """
+    words = set(re.sub(r"[?!.,]", "", message.strip().lower()).split())
+    return bool(words & _PROGRESSION_TOKENS)
 
 
 def _is_navigation_query(message: str) -> bool:
@@ -307,23 +329,31 @@ async def chat(request: ChatRequest):
         log_chat_request(request.session_id, request.message, "faq_interruption")
         return ChatResponse(answer=nav_answer, source="llm", handoff=False)
 
-    # --- FAQ interruption: locked flow + no flow keywords + not a step phrase ---
-    # Answer the FAQ question without disturbing the active flow state.
-    # Explicit keyword switches (new_intent != state.intent) bypass this gate so the
-    # user can switch services without losing context ("Как добавить объект?", etc.).
-    # Step-number questions ("что делать на 1 шагу?") also bypass — they belong to the flow.
-    # FAQ-type services (load_calculation, construction_works, etc.) never set locked —
-    # extend interruption to them so off-topic questions don't inherit wrong service context.
+    # --- FAQ interruption: off-topic question during any active flow ---
+    # Answers a side question without disturbing the active flow state.
+    # Fires when ALL of the following hold:
+    #   - an intent is active (state.intent set)
+    #   - not an explicit service switch ("Как добавить объект?")
+    #   - not a step-progression phrase ("далее", "да", etc.)
+    #   - no flow keywords for the current intent
+    #   - no step-number reference ("шаг 2", etc.)
+    #   - AND one of:
+    #       a) flow is already locked (post-step-1) — always safe, same as before
+    #       b) flow uses FAQFlow — never locks, always route off-topic to FAQ
+    #       c) pre-lock AND message contains no entity phrase — entity gate still
+    #          catches "я физ лицо" / "юр лицо" responses correctly
     active_flow = get_flow(state.intent)
     is_explicit_switch = new_intent is not None and new_intent != state.intent
     is_faq_service = state.intent is not None and isinstance(active_flow, FAQFlow)
+    _msg_has_entity = _detect_entity_from_message_only(request.message) is not None
     is_faq_interruption = (
-        (state.locked or is_faq_service)
-        and state.intent is not None
+        state.intent is not None
         and not is_explicit_switch
         and not active_flow.is_step_progression(request.message)
+        and not _contains_progression_word(request.message)
         and not has_flow_keywords(request.message, intent=state.intent)
         and _extract_step_number(request.message) is None
+        and (state.locked or is_faq_service or not _msg_has_entity)
     )
     if is_faq_interruption:
         faq_ctx = FlowContext(
@@ -399,11 +429,18 @@ async def chat(request: ChatRequest):
     state = flow.next_state(ctx)
 
     # Lock once a flow is underway — prevents accidental intent resets.
-    # TU: requires entity + step to be set (ФЛ/ЮЛ branches differ from step 1).
-    # Real estate: locks as soon as the situation is chosen (no entity gate).
+    # LinearFlow with entity gate: needs entity + step set (step 1 fields differ by ФЛ/ЮЛ).
+    # LinearFlow without entity gate: needs step set only.
+    # ScenarioFlow (real_estate): locks as soon as the situation is chosen.
+    _svc = _registry.get_service(state.intent)
+    _entity_satisfied = not (_svc and _svc.flow.requires_entity) or state.entity is not None
     _can_lock = (
-        (state.intent == "tu_application" and state.entity is not None and state.step is not None)
-        or (state.intent == "real_estate" and state.situation is not None)
+        isinstance(flow, LinearFlow)
+        and state.step is not None
+        and _entity_satisfied
+    ) or (
+        isinstance(flow, ScenarioFlow)
+        and state.situation is not None
     )
     if not state.locked and _can_lock:
         state = state.model_copy(update={"locked": True})
