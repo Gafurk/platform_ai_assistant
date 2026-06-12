@@ -93,7 +93,7 @@ Copy `.env.example` → `.env` and fill in `OPENAI_API_KEY`. Locally, `python-do
 | `frontend/` | Static UI — **must exist** before server start (StaticFiles mount fails otherwise) |
 | `data/docs/` | Staging area for uploaded raw documents |
 | `data/lightrag/` | **Persistent KG storage** (graph + embeddings) — **back this up** |
-| `tests/` | pytest test suite (200+ tests, ~95% pass rate) |
+| `tests/` | pytest test suite (300+ tests) |
 | `Dockerfile` | Multi-stage build (`python:3.11-slim`, non-root `appuser`) |
 | `docker-compose.yml` | Single `api` service; mounts `./data` + `./logs`; loads `.env` |
 | `.dockerignore` | Excludes `data/`, `logs/`, `venv/`, `tests/`, `.git/`, `.env` from build context |
@@ -111,7 +111,7 @@ POST /api/v1/chat
   ├─ rule_based → SYSTEM_COMMANDS / NAVIGATION_RULES   ← returns immediately if matched
   ├─ language detect (_detect_language — Kazakh Cyrillic: ә ғ қ ң ө ұ ү і)
   ├─ intent classify (sticky + keyword switch + page fallback)
-  ├─ navigation FAQ shortcut (status/download queries → nav path, no LLM)
+  ├─ navigation FAQ shortcut (status/download queries → LightRAG + ask_llm, source "llm"; state preserved)
   ├─ FAQ interruption gate (locked flow + no flow keywords → FAQFlow, preserve state)
   ├─ entity detect (ФЛ/ЮЛ from message + history)
   ├─ entity clarification gate (TU application blocks until entity known)
@@ -123,22 +123,25 @@ POST /api/v1/chat
 ```
 
 **Response:** `ChatResponse(answer, source, handoff)`  
-`source` values: `"rule_based"` | `"faq_interruption"` | `"llm"`
+`source` values actually returned: `"validation"` | `"rate_limit"` | `"rule_based"` | `"llm"`. Note `"faq_interruption"` is only a **log label** (`log_chat_request`), not a response `source` — both the navigation shortcut and the FAQ interruption return `source="llm"`.  
+`handoff` is **always `false`** today: `check_rule()` computes an operator/handoff flag, but the chat router discards it (`rule_answer, _ = check_rule(...)`) and hard-codes `handoff=False` on every return path. Wire it through if handoff is needed.
 
 ---
 
 ## Document Upload & Reindex Flow
 
-### Upload (incremental, no auto-index)
+### Upload (save only — NO auto-index)
 
 ```
 POST /api/v1/upload
-  → file saved as data/docs/{uuid}_{original_name}
-  → TaskQueue.submit(_run_ingestion)   ← max 2 concurrent
-  → ingest_file() [async]
-    → split_by_situations() — situation blocks → meta blocks → 800-word fallback chunks
-    → rag.ainsert(chunk) × N   ← adds to KG, never wipes
+  → validate extension (.pdf/.txt/.md/.docx)
+  → file saved as data/docs/{uuid4().hex}_{original_name}
+  → return {"status": "saved", "filename": ...}
 ```
+
+**Upload does not index.** It only writes the file to disk — there is no background ingestion. The knowledge graph is (re)built solely by `POST /api/v1/reindex` or `python ingestion/ingest.py`.
+
+> `app/services/task_queue.py` defines a `TaskQueue` (and an `ingestion_queue = TaskQueue(max_concurrent=2)` singleton), but nothing calls `.submit()` — it is currently **dead/unused code**. Do not document upload as queue-driven.
 
 Deleting via `DELETE /api/v1/documents/{filename}` removes the file from disk only — **does not** remove KG nodes from LightRAG.
 
@@ -148,22 +151,29 @@ The `/reindex` endpoint performs a complete rebuild and streams progress via **S
 
 ```
 POST /api/v1/reindex
-  → wipe data/lightrag/ directory entirely
-  → reinitialize LightRAG (lightrag_service.initialize())
-  → for each file in data/docs/:
-      → ingest_file(filepath)         ← try/except per file so one failure doesn't stop all
-      → yield SSE: {"status": "progress", "file": name, "done": N, "total": M}
-  → yield SSE: {"status": "done"}     ← guaranteed via finally block
+  → yield {"status": "wiping"} then {"status": "init"}
+  → lightrag_service.reinitialize()   ← rmtree data/lightrag/ + fresh LightRAG instance
+  → files = sorted(data/docs/*)
+  → for i, file in enumerate(files):
+      → yield {"status": "progress", "file": name, "done": i, "total": M}   ← done is 0-based
+      → ingest_file(filepath, name)   ← try/except per file; on failure yield "file_error" and continue
+  → yield {"status": "done", "total": M}
+  (top-level exception → yield {"status": "error", "message": ...} then {"status": "done"})
 ```
 
-**SSE event format:**
+**Actual SSE statuses** (no others exist):
 ```
-data: {"status": "progress", "file": "...", "done": 1, "total": 5}\n\n
-data: {"status": "ping"}\n\n          ← heartbeat every ~15s to keep connection alive
-data: {"status": "done"}\n\n          ← always sent, even on error
+data: {"status": "wiping"}\n\n
+data: {"status": "init"}\n\n
+data: {"status": "progress", "file": "...", "done": 0, "total": 5}\n\n
+data: {"status": "file_error", "file": "...", "error": "...", "done": 2, "total": 5}\n\n
+data: {"status": "done", "total": 5}\n\n          ← reached on success and after a top-level error
+data: {"status": "error", "message": "..."}\n\n   ← only on top-level failure
 ```
 
-**Frontend** handles `EventSource` `onerror` by calling `source.close()` and unlocking the UI immediately (graceful degradation — never leave the reindex button disabled on failure).
+> **There is no `ping`/heartbeat event.** Earlier docs claimed one; it is not implemented. Don't rely on it.
+
+**Frontend** consumes the stream with `fetch()` + `res.body.getReader()` + `TextDecoder` (**not** `EventSource`). The reindex button is always re-enabled in a `finally` block, so a dropped connection never leaves the UI locked.
 
 ---
 
@@ -250,12 +260,12 @@ Navigation facts are **auto-generated** from `ServiceRegistry` (reads `services.
 | `grid_disconnection` | `LinearFlow` | 2 | Yes | Отключение от электросетей |
 | `equipment_testing` | `LinearFlow` | 4 | Yes | Испытание/измерение электрооборудования; step 4 = поставщик selection |
 | `real_estate` | `ScenarioFlow` | — | No | Branching (cadastre vs address register); stores `original_question` |
-| `supply_contract_residential` | `FAQFlow` | — | No | Бытовой договор — pure retrieval |
-| `supply_contract_non_residential` | `FAQFlow` | — | No | Небытовой договор — pure retrieval |
-| `load_calculation` | `FAQFlow` | — | No | Расчёт нагрузки |
-| `draft_design` | `FAQFlow` | — | No | Эскизный проект |
-| `construction_works` | `FAQFlow` | — | No | СМР |
-| `meter_sealing` | `FAQFlow` | — | No | Установка/снятие пломбы |
+| `supply_contract_residential` | `LinearFlow` | — | No | Бытовой договор — pure retrieval |
+| `supply_contract_non_residential` | `LinearFlow` | — | No | Небытовой договор — pure retrieval |
+| `load_calculation` | `LinearFlow` | — | No | Расчёт нагрузки |
+| `draft_design` | `LinearFlow` | — | No | Эскизный проект |
+| `construction_works` | `LinearFlow` | — | No | СМР |
+| `meter_sealing` | `LinearFlow` | — | No | Установка/снятие пломбы |
 | `None` | `FAQFlow` | — | No | General FAQ; no state tracking |
 
 ### Session update modes
@@ -335,19 +345,23 @@ async def reindex_stream():
         yield 'data: {"status": "done"}\n\n'
 ```
 
-### SSE — heartbeat/ping
+### SSE — heartbeat/ping (recommended, NOT currently implemented)
 
-Send `data: {"status": "ping"}\n\n` every ~15 seconds during long operations to prevent proxy/browser timeouts from silently killing the connection.
+A `data: {"status": "ping"}\n\n` heartbeat every ~15s during long operations helps prevent proxy/browser timeouts from silently killing the connection. **The current `/reindex` stream does not send one** — add it here if you observe dropped connections on slow reindexes. (The `wiping`/`init`/`progress` events already provide some traffic in practice.)
 
 ### Frontend graceful degradation
 
-On `EventSource` `onerror` or explicit `close()`, always unlock the UI (re-enable buttons, hide spinners). Never leave the user with a frozen interface.
+The reindex client uses `fetch()` + `res.body.getReader()` (a `ReadableStream`), **not** `EventSource`. Always re-enable the UI (button, spinner) in a `finally` block so a dropped or errored stream never leaves a frozen interface.
 
 ```js
-source.onerror = () => {
-    source.close();
-    unlockUI();   // always — regardless of whether done was received
-};
+try {
+  const reader = res.body.getReader();
+  // ... read/parse "data: {...}" lines ...
+} catch (e) {
+  // show error
+} finally {
+  btn.disabled = false;   // always — regardless of whether "done" was received
+}
 ```
 
 ---
