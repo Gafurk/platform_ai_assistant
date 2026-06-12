@@ -1,13 +1,39 @@
+# Docker Compose for the iSEL AI Assistant (FastAPI + LightRAG)
+#
+# Quick start:
+#   1. cp .env.example .env   # then fill in OPENAI_API_KEY
+#   2. docker compose up --build
+#   3. Open http://localhost:8001/static/index.html
+#
+# LightRAG runs fully embedded (nano-vectordb + NetworkX), so no extra
+# database services are required — only this one app container.
+
 services:
-  # LightRAG backend services are no longer needed as external services
-  # LightRAG uses:
-  # - Local nano-vectordb (embedded, no external service)
-  # - Local NetworkX graph store (embedded, no external service)
-  # - OpenAI API (gpt-4.1-nano for LLM, text-embedding-3-small for embeddings)
-
-  # To run the application:
-  # 1. pip install lightrag-hku openai
-  # 2. Set OPENAI_API_KEY in .env
-  # 3. Run: uvicorn app.main:app --reload --port 8001
-
-volumes:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: isel-ai-assistant:latest
+    container_name: isel-ai-assistant
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    # Load configuration (OPENAI_API_KEY, model overrides, etc.) from .env
+    env_file:
+      - .env
+    environment:
+      # Fallback defaults — anything set in .env takes precedence
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-nano}
+      LIGHTRAG_EXTRACT_MODEL: ${LIGHTRAG_EXTRACT_MODEL:-gpt-4.1-nano}
+    volumes:
+      # Persist the knowledge graph / vector store and uploaded docs
+      - ./data:/app/data
+      # Persist application logs
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8001/health', timeout=4).status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
