@@ -9,6 +9,27 @@ FastAPI RAG chatbot for the **iSEL** platform. Answers user questions in **Russi
 
 ## Quick Start
 
+### Option A — Docker (recommended)
+
+The fastest way to run the full stack. LightRAG is embedded, so the app is the only container — no external databases.
+
+```bash
+# 1. Configure environment
+cp .env.example .env       # then edit .env and set OPENAI_API_KEY
+
+# 2. Build and start
+docker compose up --build  # add -d to run in the background
+
+# 3. (Optional) ingest documents into the knowledge graph
+docker compose exec api python ingestion/ingest.py
+```
+
+Then open `http://localhost:8001/static/index.html`.
+
+`./data` (knowledge graph + uploaded docs) and `./logs` are bind-mounted, so they persist across container restarts and rebuilds. See [Deployment (Docker)](#deployment-docker) for details.
+
+### Option B — Local (venv)
+
 ```bash
 # 1. Virtual environment
 python -m venv venv
@@ -18,11 +39,8 @@ venv\Scripts\Activate.ps1        # PowerShell
 # 2. Dependencies
 pip install -r requirements.txt
 
-# 3. Create .env
-OPENAI_API_KEY=sk-...
-LLM_PROVIDER=openai
-OPENAI_MODEL=gpt-5-mini            # chat responses — reasoning model OK
-LIGHTRAG_EXTRACT_MODEL=gpt-4.1-nano  # entity extraction — NON-reasoning only
+# 3. Configure environment
+cp .env.example .env             # then edit .env and set OPENAI_API_KEY
 
 # 4. Ingest documents into the knowledge graph
 python ingestion/ingest.py
@@ -47,6 +65,7 @@ uvicorn app.main:app --reload --port 8001
 | Session state | In-memory `SessionManager` — lost on restart |
 | Streaming | Server-Sent Events (reindex progress) |
 | Config | YAML: `config/services.yaml`, `config/keywords.yaml` |
+| Deployment | Docker + Docker Compose (multi-stage build, non-root, embedded LightRAG) |
 
 ### Which model does what
 
@@ -78,18 +97,14 @@ app/
 │   ├── chat.py               # POST /api/v1/chat
 │   └── documents.py          # upload / list / delete / reindex
 ├── services/
-│   ├── lightrag_service.py   # LightRAG init + search_docs() core implementation
-│   ├── rag.py                # Thin wrapper — delegates to lightrag_service.search_docs()
+│   ├── lightrag_service.py   # LightRAG init + search_docs()
 │   ├── llm_service.py        # OpenAI/Ollama call
 │   ├── prompt_builder.py     # Static base prompt + dynamic suffix (prefix caching)
 │   ├── rulebased.py          # SYSTEM_COMMANDS + NAVIGATION_RULES (zero LLM cost)
 │   ├── session.py            # SessionManager
-│   ├── translit.py           # Kazakh transliteration (Russian letters → KZ Cyrillic)
 │   ├── rate_limit.py         # Per-session rate limiter
 │   ├── task_queue.py         # Async ingestion queue (max 2 concurrent)
 │   └── validation.py         # Input validation
-└── utils/
-│   └── logger.py             # Structured logging (chat requests, RAG searches, errors)
 └── main.py                   # App entry point, StaticFiles mount
 
 config/
@@ -105,6 +120,12 @@ data/
 
 frontend/                     # Static UI (glassmorphism widget)
 tests/                        # pytest suite, 200+ tests, ~95% pass rate
+
+Dockerfile                    # Multi-stage build (python:3.11-slim, non-root user)
+docker-compose.yml            # Single `api` service; mounts ./data + ./logs
+.dockerignore                 # Excludes data/, logs/, venv/, tests/, .git/, .env
+.env.example                  # Copy to .env and fill in OPENAI_API_KEY
+requirements.txt              # Python dependencies
 ```
 
 ---
@@ -120,21 +141,19 @@ POST /api/v1/chat
   │    SYSTEM_COMMANDS: greetings, identity, handoff
   │    NAVIGATION_RULES: status/download queries (zero LLM tokens)
   │
-  ├─ KZ transliteration (_safe_normalize_kz — Russian-letter Kazakh → KZ Cyrillic)
-  ├─ language detect (Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і; KZ entity abbrevs: ЖТ/ЗТ)
+  ├─ language detect (Kazakh Cyrillic heuristic: ә ғ қ ң ө ұ ү і)
   ├─ intent classify (sticky → keyword switch → page fallback)
-  ├─ navigation FAQ shortcut   ──→ search_docs(intent=None) + ask_llm, history-only update
+  ├─ navigation FAQ shortcut   ──→ nav path answer, no LLM
   ├─ FAQ interruption gate     ──→ FAQFlow answer, flow state preserved
-  ├─ entity detect (ФЛ / ЮЛ from message + history; message-only for intent switch)
-  ├─ entity clarification gate (blocks LinearFlow until entity known; skipped for steps 2–5)
+  ├─ entity detect (ФЛ / ЮЛ from message + history)
+  ├─ entity clarification gate (blocks LinearFlow until entity known)
   ├─ flow.next_state()         ──→ LinearFlow / ScenarioFlow / FAQFlow
-  ├─ effective_step resolve    ──→ explicit шаг N > state.step > 1 (if intent, non-scenario) > None
   ├─ search_docs()             ──→ LightRAG hybrid + intent/step filter
   ├─ ask_llm()                 ──→ OpenAI with cached static prompt + dynamic suffix
   └─ session.update()          ──→ state + history (capped at 10 entries / 5 turns)
 
 Response: ChatResponse(answer, source, handoff)
-source values: "rule_based" | "faq_interruption" | "llm" | "validation" | "rate_limit"
+source values: "rule_based" | "faq_interruption" | "llm"
 ```
 
 ---
@@ -205,14 +224,14 @@ All definitions live in `config/services.yaml` + `config/keywords.yaml`. **Addin
 | `grid_disconnection` | Отключение от электросетей | Linear | 2 | Yes |
 | `equipment_testing` | Испытание, измерение электрооборудования | Linear | 4 | Yes |
 | `real_estate` | Добавление объекта недвижимости | Scenario | — | No |
-| `supply_contract_residential` | Договор электроснабжения (бытовой) | Linear | 4 | No |
-| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | Linear | 4 | No |
-| `load_calculation` | Расчёт электрической нагрузки | Linear | 4 | Yes |
-| `draft_design` | Разработка эскизного проекта | Linear | 3 | Yes |
-| `construction_works` | Строительно-монтажные работы | Linear | 4 | Yes |
-| `meter_sealing` | Установка/снятие пломбы | Linear | 2 | Yes |
+| `supply_contract_residential` | Договор электроснабжения (бытовой) | FAQ | — | No |
+| `supply_contract_non_residential` | Договор электроснабжения (небытовой) | FAQ | — | No |
+| `load_calculation` | Расчёт электрической нагрузки | FAQ | — | No |
+| `draft_design` | Разработка эскизного проекта | FAQ | — | No |
+| `construction_works` | Строительно-монтажные работы | FAQ | — | No |
+| `meter_sealing` | Установка/снятие пломбы | FAQ | — | No |
 
-**Entity gate** — LinearFlow blocks at step 0 until user identifies as ФЛ (individual) or ЮЛ (legal entity). Step 1 form fields differ by entity type. Steps 2–5 are shared and skip the gate.
+**Entity gate** — LinearFlow blocks at step 0 until user identifies as ФЛ (individual) or ЮЛ (legal entity). Step 1 form fields differ by entity type.
 
 ---
 
@@ -255,8 +274,7 @@ Navigation facts are **auto-generated** from `ServiceRegistry`. Add new paths to
 1. **Situation blocks** — `Ситуация \d+` / `Жағдай \d+` / `Шаг \d+` → one LightRAG insert each.
 2. **Meta blocks** — `Цель интента` / `Мақсаты` / `Требования` → lower priority.
 3. **Deduplication** — keeps highest-quality version of duplicate situations.
-4. **Entity split** (`_split_by_entity`) — chunks containing both `Для ФЛ:` and `Для ЮЛ:` sections are split into separate sub-chunks so the LLM never receives both entity types at once.
-5. **Fallback** — 800-word fixed chunks (overlap=100) if no structured headers found.
+4. **Fallback** — 800-word fixed chunks (overlap=100) if no structured headers found.
 
 Each chunk gets a metadata header:
 ```
@@ -269,13 +287,13 @@ Each chunk gets a metadata header:
 
 ## LightRAG Search Pipeline
 
-`search_docs()` in `app/services/lightrag_service.py` (exposed via `app/services/rag.py`):
+`search_docs()` in `app/services/lightrag_service.py`:
 
 1. **Query enrichment** — prepend `[TITLE: Шаг N]`, `[INTENT: slug]`, `[entity]`.
 2. **Hybrid search** — graph traversal + vector similarity (`top_k=20`, `only_need_context=True`).
 3. **Intent filter** — keep only chunks whose `[INTENT:]` tag matches current intent.
 4. **Step filter** — if `current_step` is set, keep only chunks containing `Шаг N`; return `""` if none (triggers fallback).
-5. **Step fallback** — retry with bare `"Шаг N"`, `top_k*2`, no metadata prefix.
+5. **Step fallback** — retry with `"Шаг N {query}"`, `top_k*2`, no metadata prefix.
 
 Two separate OpenAI clients: `_oai_embeddings` (timeout 300s) and `_oai_llm` (timeout 600s). Kept separate because a shared short-timeout client would abort slow entity extractions mid-run.
 
@@ -292,7 +310,46 @@ python -m pytest tests/test_service_registry.py -v
 
 ---
 
+## Deployment (Docker)
+
+The app ships with a multi-stage `Dockerfile` and a `docker-compose.yml`. LightRAG runs fully embedded (NetworkX graph + nano-vectordb), so the `api` container is the only service required — no external vector or graph database.
+
+```bash
+cp .env.example .env          # set OPENAI_API_KEY
+docker compose up --build -d  # build image + start in background
+docker compose logs -f api    # follow logs
+docker compose down           # stop (data + logs persist on host)
+```
+
+**What the setup does**
+
+- **Multi-stage build** — dependencies are compiled into an isolated venv in a builder stage, then copied into a slim `python:3.11-slim` runtime image.
+- **Non-root** — the container runs as the unprivileged `appuser` (uid 1000).
+- **Port** — host `8001` → container `8001` (`uvicorn app.main:app`, no `--reload`).
+- **Persistence** — `./data` (knowledge graph + uploaded docs) and `./logs` are bind-mounted, surviving restarts and rebuilds. **Back up `./data/lightrag` before any reindex/wipe.**
+- **Config** — environment is read from `.env` via Compose's `env_file`.
+- **Healthcheck** — the container polls `GET /health` every 30s.
+
+**Common tasks**
+
+```bash
+# Bulk-ingest everything in data/docs/ into the knowledge graph
+docker compose exec api python ingestion/ingest.py
+
+# Run the test suite inside the container
+docker compose exec api python -m pytest tests/ -v
+
+# Rebuild after changing requirements.txt
+docker compose up --build -d
+```
+
+> **Bind-mount permissions (Linux).** The container writes as uid 1000. If `./data` or `./logs` end up root-owned and you hit "permission denied", run `sudo chown -R 1000:1000 data logs` once, or create the dirs yourself before the first start. On Docker Desktop (macOS/Windows) this is handled automatically.
+
+---
+
 ## Environment Variables
+
+All variables live in `.env` — copy `.env.example` to `.env` and fill in your key. Under Docker Compose they are loaded automatically via `env_file`; for local runs `python-dotenv` reads `.env` at startup.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
