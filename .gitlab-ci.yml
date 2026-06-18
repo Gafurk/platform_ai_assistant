@@ -19,6 +19,8 @@ lint:
   stage: lint
   extends: .python
   before_script:
+    - python -m venv .venv
+    - . .venv/bin/activate
     - pip install --quiet ruff
   script:
     - ruff check app/ tests/ ingestion/
@@ -27,6 +29,8 @@ test:
   stage: test
   extends: .python
   before_script:
+    - python -m venv .venv
+    - . .venv/bin/activate
     - pip install --quiet -r requirements.txt pytest pytest-asyncio pytest-cov
   script:
     - pytest tests/ -v --cov=app --cov-report=term-missing --cov-report=xml
