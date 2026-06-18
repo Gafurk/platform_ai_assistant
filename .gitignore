@@ -1,25 +1,42 @@
-# Python
-venv/
+# ── Python ────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
 *.egg-info/
+.eggs/
 dist/
 build/
+venv/
+.venv/
+env/
 
-# Data & Storage
-data/docs/
-data/lightrag/
+# ── Environment & secrets ─────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Local data & storage (volume-mounted, never committed) ─
+data/
 *.db
+*.sqlite3
 
-# Logs
+# ── Logs ──────────────────────────────────────────────────
 logs/
 *.log
 
-# IDE
+# ── Test & lint caches ────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ── AI tooling (local only) ───────────────────────────────
+.ai-activity/
+.claude/
+
+# ── IDE / OS ──────────────────────────────────────────────
 .idea/
 .vscode/
-
-# Claude Code
-.ai-activity/
+.DS_Store
+Thumbs.db
